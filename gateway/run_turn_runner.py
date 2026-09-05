@@ -1658,6 +1658,12 @@ class TurnRunner:
             "last_prompt_tokens": getattr(comp, "last_prompt_tokens", 0) if has_comp else 0,
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) if has_comp else 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) if has_comp else 0,
+            "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) if agent else 0,
+            "total_tokens": getattr(agent, "session_total_tokens", 0) if agent else 0,
+            "api_latency_history": list(getattr(agent, "_api_latency_history", ()) or ()) if agent else [],
+            "api_output_history": list(getattr(agent, "_api_output_history", ()) or ()) if agent else [],
+            "reasoning": ((reasoning_config or {}).get("effort") or
+                          ("off" if (reasoning_config or {}).get("enabled") is False else None)),
             "model": getattr(agent, "model", None) if agent else None,
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
         }

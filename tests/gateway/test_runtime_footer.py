@@ -246,6 +246,78 @@ def test_build_footer_line_threads_turn_seconds(monkeypatch):
     assert out == "gpt-5.4 · 22s"
 
 
+def test_opt_in_usage_fields_render_from_session_metrics():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["reasoning", "tps", "cache_hit", "total_tokens"],
+                }
+            }
+        },
+        platform_key="slack",
+        model="gpt-5.6-sol",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        reasoning="low",
+        api_latency_history=[2.1, 4.3],
+        api_output_history=[130, 190],
+        session_prompt_tokens=27_873,
+        session_cache_read_tokens=24_369,
+        session_total_tokens=123_456,
+    )
+    assert out == "low · 50 t/s · 87% hit · Σ123.5k"
+
+
+def test_usage_fields_omit_missing_or_invalid_metrics():
+    out = format_runtime_footer(
+        model="m",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        reasoning=None,
+        api_latency_history=[0.0],
+        api_output_history=[100],
+        session_prompt_tokens=100,
+        session_cache_read_tokens=0,
+        session_total_tokens=0,
+        fields=("reasoning", "tps", "cache_hit", "total_tokens"),
+    )
+    assert out == ""
+
+
+def test_gateway_caller_threads_agent_usage_into_footer(monkeypatch):
+    from gateway import run
+    from gateway.config import Platform
+    from gateway.run_turn import GatewayTurnMixin
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(run, "_load_gateway_config", lambda: {
+        "display": {"platforms": {"slack": {"runtime_footer": {
+            "enabled": True,
+            "fields": ["reasoning", "tps", "cache_hit", "total_tokens"],
+        }}}}
+    })
+    monkeypatch.setattr(run, "_terminal_scope_cwd", lambda _default: "")
+    runner = GatewayTurnMixin()
+    runner._reasoning_config = {"enabled": True, "effort": "low"}
+    source = SimpleNamespace(platform=Platform.SLACK)
+
+    out = runner._hmwa_runtime_footer_line({
+        "model": "gpt-5.6-sol",
+        "reasoning": "medium",
+        "api_latency_history": [2.1, 4.3],
+        "api_output_history": [130, 190],
+        "input_tokens": 27_873,
+        "cache_read_tokens": 24_369,
+        "total_tokens": 123_456,
+    }, source, 10.0)
+
+    assert out == "medium · 50 t/s · 87% hit · Σ123.5k"
+
+
 # ---------------------------------------------------------------------------
 # Byte-stability: `latency` is opt-in, so the DEFAULT footer is unchanged.
 #

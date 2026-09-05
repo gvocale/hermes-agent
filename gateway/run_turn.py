@@ -1466,6 +1466,12 @@ class GatewayTurnMixin:
                 context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                 context_length=agent_result.get("context_length") or None,
                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+                reasoning=agent_result.get("reasoning"),
+                api_latency_history=agent_result.get("api_latency_history") or (),
+                api_output_history=agent_result.get("api_output_history") or (),
+                session_prompt_tokens=agent_result.get("input_tokens", 0) or 0,
+                session_cache_read_tokens=agent_result.get("cache_read_tokens", 0) or 0,
+                session_total_tokens=agent_result.get("total_tokens", 0) or 0,
             )
         except Exception as _footer_err:
             logger.debug("runtime_footer build failed: %s", _footer_err)
