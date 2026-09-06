@@ -23,9 +23,9 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
-def _make_source() -> SessionSource:
+def _make_source(platform=Platform.TELEGRAM) -> SessionSource:
     return SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         user_id="u1",
         chat_id="c1",
         user_name="tester",
@@ -33,11 +33,11 @@ def _make_source() -> SessionSource:
     )
 
 
-def _event(text: str) -> MessageEvent:
+def _event(text: str, platform=Platform.TELEGRAM) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=_make_source(),
+        source=_make_source(platform),
     )
 
 
@@ -145,3 +145,16 @@ async def test_warning_enrichment_is_offloaded(tmp_path, monkeypatch):
         "enrich_model_switch_warnings_for_gateway must be dispatched via "
         "asyncio.to_thread (it was called inline on the event loop instead)"
     )
+
+
+@pytest.mark.asyncio
+async def test_model_switch_confirmation_adds_actual_model_emoji_only_on_slack(
+    tmp_path, monkeypatch
+):
+    runner = _runner_with_store(tmp_path, monkeypatch)
+
+    slack = await runner._handle_model_command(_event("/model gpt-5.5", Platform.SLACK))
+    telegram = await runner._handle_model_command(_event("/model gpt-5.5", Platform.TELEGRAM))
+
+    assert slack is not None and slack.startswith(":openai: ")
+    assert telegram is not None and not telegram.startswith(":openai: ")

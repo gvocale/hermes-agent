@@ -15,6 +15,12 @@ from typing import Any, Iterable, Optional
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
+_SLACK_MODEL_EMOJI_MARKERS = (
+    (":openai:", ("openai", "chatgpt", "codex", "gpt-")),
+    (":grok:", ("grok", "xai")),
+    (":claude:", ("claude", "anthropic", "fable")),
+)
+
 
 def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
@@ -33,6 +39,16 @@ def _home_relative_cwd(cwd: str) -> str:
 def _model_short(model: Optional[str]) -> str:
     """Drop ``vendor/`` prefix (``openai/gpt-5.4`` → ``gpt-5.4``)."""
     return model.rsplit("/", 1)[-1] if model else ""
+
+
+def slack_model_emoji(model: Optional[str], provider: Optional[str] = None) -> str:
+    """Return the custom Slack emoji for a resolved model identity, if known."""
+    for identity in (model, provider):
+        value = str(identity or "").lower()
+        for emoji, markers in _SLACK_MODEL_EMOJI_MARKERS:
+            if any(marker in value for marker in markers):
+                return emoji
+    return ""
 
 
 def _env_cwd() -> str:
@@ -87,7 +103,8 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
                           api_output_history: Iterable[int] = (),
                           session_prompt_tokens: int = 0, session_cache_read_tokens: int = 0,
                           session_total_tokens: int = 0,
-                          fields: Iterable[str] = _DEFAULT_FIELDS) -> str:
+                          fields: Iterable[str] = _DEFAULT_FIELDS,
+                          model_prefix: str = "") -> str:
     """Render the footer line, or "" if no fields have data. Fields whose data is missing (and
     unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots."""
     def context_pct() -> str:
@@ -104,7 +121,7 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
                  if session_prompt_tokens > 0 and session_cache_read_tokens > 0 else None)
 
     renderers = {
-        "model": lambda: _model_short(model),
+        "model": lambda: f"{model_prefix} {_model_short(model)}" if model_prefix and model else _model_short(model),
         "reasoning": lambda: reasoning or "",
         "context_pct": context_pct,
         # Skipped when the caller did not measure (None) or the value is negative.
@@ -132,6 +149,7 @@ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str |
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
+    model_prefix = slack_model_emoji(model) if platform_key == "slack" else ""
     return format_runtime_footer(model=model, context_tokens=context_tokens,
                                  context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
                                  reasoning=reasoning, api_latency_history=api_latency_history,
@@ -139,4 +157,5 @@ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str |
                                  session_prompt_tokens=session_prompt_tokens,
                                  session_cache_read_tokens=session_cache_read_tokens,
                                  session_total_tokens=session_total_tokens,
-                                 fields=cfg.get("fields") or _DEFAULT_FIELDS)
+                                 fields=cfg.get("fields") or _DEFAULT_FIELDS,
+                                 model_prefix=model_prefix)

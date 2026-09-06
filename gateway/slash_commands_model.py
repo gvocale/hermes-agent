@@ -307,6 +307,13 @@ class GatewayModelCommandsMixin:
             t("gateway.model.switched", model=format_model_for_display(result.new_model)),
             t("gateway.model.provider_label", provider=result.provider_label or result.target_provider),
         ]
+        platform_key = getattr(getattr(ctx.source, "platform", None), "value", "")
+        if platform_key == "slack":
+            from gateway.runtime_footer import slack_model_emoji
+
+            emoji = slack_model_emoji(result.new_model, result.target_provider)
+            if emoji:
+                lines[0] = f"{emoji} {lines[0]}"
         # Provider-aware chain: Codex OAuth, Copilot and Nous caps win over the raw models.dev entry.
         mi = result.model_info
         model_cfg: dict = {}

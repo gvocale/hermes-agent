@@ -13,6 +13,7 @@ from gateway.runtime_footer import (
     build_footer_line,
     format_runtime_footer,
     resolve_footer_config,
+    slack_model_emoji,
 )
 
 
@@ -131,6 +132,33 @@ def test_build_footer_per_platform_off_suppresses():
         cwd="/tmp",
     )
     assert out == ""
+
+
+@pytest.mark.parametrize(
+    "model,provider,expected",
+    [
+        ("opaque-model-id", "openai-codex", ":openai:"),
+        ("grok-4.6", "xai-oauth", ":grok:"),
+        ("claude-fable-5-1", "openrouter", ":claude:"),
+        ("hermes-4.5-405b", "nous", ""),
+    ],
+)
+def test_slack_model_emoji_maps_model_identity(model, provider, expected):
+    assert slack_model_emoji(model, provider) == expected
+
+
+def test_build_footer_adds_model_emoji_only_for_slack():
+    config = {"display": {"runtime_footer": {"enabled": True, "fields": ["model"]}}}
+    common = dict(
+        user_config=config,
+        model="openrouter/openai/gpt-5.6-sol",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+    )
+
+    assert build_footer_line(platform_key="slack", **common) == ":openai: gpt-5.6-sol"
+    assert build_footer_line(platform_key="discord", **common) == "gpt-5.6-sol"
 
 
 

@@ -35,7 +35,6 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from agent.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
-from hermes_cli.config import load_config_readonly
 from hermes_constants import get_hermes_home
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome,
@@ -92,61 +91,6 @@ def _slack_unfurl_kwargs(extra: Optional[Dict[str, Any]]) -> Dict[str, bool]:
         elif isinstance(val, str) and val.strip().lower() in _BOOL_WORDS:
             kwargs[key] = val.strip().lower() in {"1", "true", "yes", "on"}
     return kwargs
-
-
-# Slack's bot avatar is app-global. ``chat:write.customize`` lets each message
-# carry the provider identity instead, which is important when several Hermes
-# profiles share a workspace but represent different model providers.
-_PROVIDER_ICON_URLS = {
-    "openai": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-png/light/openai.png",
-    "claude": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-png/light/claude.png",
-    "grok": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-png/light/grok.png",
-}
-
-
-_OPENAI_MARKERS = ("openai", "openai-codex", "chatgpt", "codex", "luna", "sol", "gpt-5", "gpt-4")
-_CLAUDE_MARKERS = ("anthropic", "claude", "fable")
-_GROK_MARKERS = ("xai-oauth", "xai", "grok")
-
-
-def _icon_for_identity(identity: str) -> Optional[str]:
-    blob = identity.lower()
-    if any(marker in blob for marker in _OPENAI_MARKERS):
-        return _PROVIDER_ICON_URLS["openai"]
-    if any(marker in blob for marker in _CLAUDE_MARKERS):
-        return _PROVIDER_ICON_URLS["claude"]
-    if any(marker in blob for marker in _GROK_MARKERS):
-        return _PROVIDER_ICON_URLS["grok"]
-    return None
-
-
-def _provider_icon_url(
-    provider: str = "", model: str = "", text: str = "",
-) -> Optional[str]:
-    """Return the provider icon for this message.
-
-    Session/turn identity (``model``, footer ``text``) wins over the profile
-    default so ``!model`` mid-thread can change the Slack avatar per post.
-    """
-    explicit = _icon_for_identity(f"{provider}:{model}")
-    if explicit:
-        return explicit
-    if text:
-        lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-        last = lines[-1] if lines else ""
-        if last and ("·" in last or " • " in last):
-            from_text = _icon_for_identity(last)
-            if from_text:
-                return from_text
-    try:
-        config = load_config_readonly()
-        model_config = config.get("model", {})
-        cfg_provider = str(model_config.get("provider", "")).strip().lower()
-        cfg_model = str(model_config.get("default", "")).strip().lower()
-    except Exception:  # pragma: no cover - icon decoration must never block delivery
-        logger.debug("[Slack] Could not resolve provider icon", exc_info=True)
-        return None
-    return _icon_for_identity(f"{cfg_provider}:{cfg_model}")
 
 
 async def _read_error_text_limited(
@@ -2129,15 +2073,6 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             return await getattr(client_fn(), method)(**kwargs)
         except Exception as e:
-            if kwargs.get("icon_url") and self._is_custom_icon_payload_rejection(e):
-                retry_kwargs = dict(kwargs)
-                retry_kwargs.pop("icon_url", None)
-                logger.warning(
-                    "[Slack] Provider icon rejected; retrying %s with the app avatar. "
-                    "Grant chat:write.customize and reinstall the Slack app to enable provider icons: %s",
-                    verb, e)
-                return await self._call_with_block_fallback(
-                    client_fn, method, retry_kwargs, verb)
             if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                 retry_kwargs = dict(kwargs)
                 if verb == "edit":
@@ -2148,18 +2083,6 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
                 return await getattr(client_fn(), method)(**retry_kwargs)
             raise
-
-    @staticmethod
-    def _is_custom_icon_payload_rejection(exc: BaseException) -> bool:
-        """Whether Slack rejected only the per-message provider identity override."""
-        response = getattr(exc, "response", None)
-        payload = _slack_response_payload(response) if response is not None else {}
-        error = str(payload.get("error", "") or "").lower()
-        needed = str(payload.get("needed", "") or "").lower()
-        text = str(exc).lower()
-        if error == "missing_scope":
-            return "chat:write.customize" in needed or "icon_url" in text
-        return any(marker in text for marker in ("icon_url", "invalid_arg_name"))
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -2234,14 +2157,6 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs = {
                 "channel": chat_id, "text": chunk,
                 "mrkdwn": True, **_slack_unfurl_kwargs(self.config.extra)}
-            md = metadata or {}
-            provider_icon = _provider_icon_url(
-                provider=str(md.get("provider") or ""),
-                model=str(md.get("model") or ""),
-                text=content or formatted,
-            )
-            if provider_icon:
-                kwargs["icon_url"] = provider_icon
             if blocks and i == 0:
                 kwargs["blocks"] = blocks
             if thread_ts:
@@ -2497,13 +2412,6 @@ class SlackAdapter(BasePlatformAdapter):
             start_kwargs["recipient_team_id"] = str(team_id)
         if text:
             start_kwargs["markdown_text"] = text
-        provider_icon = _provider_icon_url(
-            provider=str(md.get("provider") or ""),
-            model=str(md.get("model") or ""),
-            text=text or "",
-        )
-        if provider_icon:
-            start_kwargs["icon_url"] = provider_icon
         response = await client.chat_startStream(**start_kwargs)
         ts = response.get("ts") if response else None
         if not ts:
