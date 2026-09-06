@@ -5,7 +5,9 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 """
 
 import asyncio
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -14,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from hermes_cli.config import get_config_path, read_raw_config
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_profiles import (
-    _approval_mode_of, _aux_task_summary, _aux_usage_rows, _broadcast_gateway_session_info, _is_other_profile, _merge_aux_into_by_model,
+    _approval_mode_of, _aux_task_summary, _aux_usage_rows, _broadcast_gateway_session_info, _is_other_profile,
 )
 from hermes_cli.web_models import RawConfigUpdate
 
@@ -23,6 +25,7 @@ router = APIRouter()
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.web_server_sessions")
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
+_config_profile_scope = late("_config_profile_scope", "hermes_cli.web_server_profiles")
 save_config = late("save_config", "hermes_cli.config")
 
 # ── Raw YAML config ──────────────────────────────────────────────────────────
@@ -70,8 +73,8 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
 
-def _rows(db, sql: str, cutoff: float) -> List[Dict[str, Any]]:
-    return [dict(r) for r in db._conn.execute(sql, (cutoff,)).fetchall()]
+def _rows(db, sql: str, *params: float) -> List[Dict[str, Any]]:
+    return [dict(r) for r in db._conn.execute(sql, params).fetchall()]
 
 
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
@@ -95,22 +98,82 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
         """, cutoff)
 
         by_model = _rows(db, """
-            SELECT model,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
-            GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
+            SELECT u.model,
+                   u.billing_provider as provider,
+                   SUM(u.input_tokens) as input_tokens,
+                   SUM(u.output_tokens) as output_tokens,
+                   COALESCE(SUM(u.estimated_cost_usd), 0) as estimated_cost,
+                   COUNT(DISTINCT u.session_id) as sessions,
+                   SUM(COALESCE(u.api_call_count, 0)) as api_calls
+            FROM session_model_usage u
+            JOIN sessions s ON s.id = u.session_id
+            WHERE s.started_at > ? AND u.model IS NOT NULL AND u.model != ''
+            GROUP BY u.model, u.billing_provider
+            ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC
         """, cutoff)
 
-        # Fold in auxiliary usage (vision, compression, ...) from session_model_usage.
-        # Aux calls never touch the sessions counters, so this is add-only — no double count.
-        # Without it the models list shows only the main agent model even when aux models are actively
-        # burning tokens (issue #23270).
+        # Gateway sessions report cumulative totals (absolute=True), so they do not
+        # create session_model_usage rows. Add only the portion of each session that
+        # has not already been attributed to a per-call model/provider row.
+        residual = _rows(db, """
+            SELECT s.model,
+                   s.billing_provider as provider,
+                   SUM(CASE WHEN COALESCE(s.input_tokens, 0) > COALESCE(m.input_tokens, 0)
+                            THEN COALESCE(s.input_tokens, 0) - COALESCE(m.input_tokens, 0)
+                            ELSE 0 END) as input_tokens,
+                   SUM(CASE WHEN COALESCE(s.output_tokens, 0) > COALESCE(m.output_tokens, 0)
+                            THEN COALESCE(s.output_tokens, 0) - COALESCE(m.output_tokens, 0)
+                            ELSE 0 END) as output_tokens,
+                   SUM(CASE WHEN COALESCE(s.estimated_cost_usd, 0) > COALESCE(m.estimated_cost, 0)
+                            THEN COALESCE(s.estimated_cost_usd, 0) - COALESCE(m.estimated_cost, 0)
+                            ELSE 0 END) as estimated_cost,
+                   SUM(CASE WHEN m.session_id IS NULL THEN 1 ELSE 0 END) as sessions,
+                   SUM(CASE WHEN COALESCE(s.api_call_count, 0) > COALESCE(m.api_calls, 0)
+                            THEN COALESCE(s.api_call_count, 0) - COALESCE(m.api_calls, 0)
+                            ELSE 0 END) as api_calls
+            FROM sessions s
+            LEFT JOIN (
+                SELECT session_id,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls
+                FROM session_model_usage
+                WHERE task = ''
+                GROUP BY session_id
+            ) m ON m.session_id = s.id
+            WHERE s.started_at > ? AND s.model IS NOT NULL AND s.model != ''
+            GROUP BY s.model, s.billing_provider
+        """, cutoff)
+        merged = {
+            (row.get("model") or "", row.get("provider") or ""): dict(row)
+            for row in by_model
+        }
+        for row in residual:
+            if not any((row.get(key) or 0) for key in (
+                "input_tokens", "output_tokens", "estimated_cost", "sessions", "api_calls",
+            )):
+                continue
+            key = (row.get("model") or "", row.get("provider") or "")
+            target = merged.setdefault(key, {
+                "model": row.get("model") or "unknown",
+                "provider": row.get("provider") or "",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "estimated_cost": 0,
+                "sessions": 0,
+                "api_calls": 0,
+            })
+            for field in ("input_tokens", "output_tokens", "estimated_cost", "sessions", "api_calls"):
+                target[field] = (target.get(field) or 0) + (row.get(field) or 0)
+        by_model = sorted(
+            merged.values(),
+            key=lambda row: (row.get("input_tokens") or 0) + (row.get("output_tokens") or 0),
+            reverse=True,
+        )
+
+        # Aux task summary only (tokens already in by_model via session_model_usage).
         aux_rows = _aux_usage_rows(db, cutoff)
-        by_model = _merge_aux_into_by_model(by_model, aux_rows)
 
         totals = _rows(db, """
             SELECT SUM(input_tokens) as total_input,
@@ -200,7 +263,7 @@ def _model_capabilities(provider: str, model_name: str) -> dict:
     """models.dev capability metadata for the card; {} when unknown or lookup fails."""
     try:
         from agent.models_dev import get_model_capabilities
-        mc = get_model_capabilities(provider=provider, model=model_name)
+        mc = get_model_capabilities(provider=provider, model=model_name, allow_network=True)
     except Exception:
         return {}
     if mc is None:
@@ -225,30 +288,133 @@ _MODEL_CARD_KEYS = (
 )
 
 
+def _merge_usage_rows(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add extra (model, billing_provider) rows into base by summing numeric keys."""
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for row in base + extra:
+        key = (row.get("model") or "", row.get("billing_provider") or "")
+        target = merged.get(key)
+        if target is None:
+            merged[key] = dict(row)
+            continue
+        for field in _MODEL_CARD_KEYS:
+            if field == "last_used_at":
+                target[field] = max(target.get(field) or 0, row.get(field) or 0)
+            elif field == "avg_tokens_per_session":
+                continue
+            else:
+                target[field] = (target.get(field) or 0) + (row.get(field) or 0)
+        total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
+        sessions = target.get("sessions") or 0
+        target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
+    return list(merged.values())
+
+
 def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     """Per-model token/cost/session breakdown plus models.dev capability metadata."""
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
 
-        raw_rows = _rows(db, """
-            SELECT model,
-                   billing_provider,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls,
-                   SUM(tool_call_count) as tool_calls,
-                   MAX(started_at) as last_used_at,
-                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-            GROUP BY model, billing_provider
-            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, cutoff)
+        # Per-call attribution lives in session_model_usage. The sessions row keeps
+        # only the last/main (model, billing_provider), so grouping sessions dumps
+        # mixed-provider usage onto one card.
+        try:
+            raw_rows = _rows(db, """
+                SELECT u.model,
+                       u.billing_provider,
+                       SUM(u.input_tokens) as input_tokens,
+                       SUM(u.output_tokens) as output_tokens,
+                       SUM(u.cache_read_tokens) as cache_read_tokens,
+                       SUM(u.reasoning_tokens) as reasoning_tokens,
+                       COALESCE(SUM(u.estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(u.actual_cost_usd), 0) as actual_cost,
+                       COUNT(DISTINCT u.session_id) as sessions,
+                       SUM(COALESCE(u.api_call_count, 0)) as api_calls,
+                       0 as tool_calls,
+                       MAX(u.last_seen) as last_used_at,
+                       AVG(u.input_tokens + u.output_tokens) as avg_tokens_per_session
+                FROM session_model_usage u
+                JOIN sessions s ON s.id = u.session_id
+                WHERE s.started_at > ? AND u.task = ''
+                  AND u.model IS NOT NULL AND u.model != ''
+                GROUP BY u.model, u.billing_provider
+                ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC
+            """, cutoff)
+        except Exception:
+            raw_rows = []
+
+        # Legacy / absolute-only sessions: tokens on the sessions row not yet
+        # attributed in session_model_usage (task='') belong to the session route.
+        try:
+            residual = _rows(db, """
+                SELECT s.model,
+                       s.billing_provider,
+                       SUM(CASE WHEN COALESCE(s.input_tokens, 0) > COALESCE(m.input_tokens, 0)
+                                THEN COALESCE(s.input_tokens, 0) - COALESCE(m.input_tokens, 0)
+                                ELSE 0 END) as input_tokens,
+                       SUM(CASE WHEN COALESCE(s.output_tokens, 0) > COALESCE(m.output_tokens, 0)
+                                THEN COALESCE(s.output_tokens, 0) - COALESCE(m.output_tokens, 0)
+                                ELSE 0 END) as output_tokens,
+                       SUM(CASE WHEN COALESCE(s.cache_read_tokens, 0) > COALESCE(m.cache_read_tokens, 0)
+                                THEN COALESCE(s.cache_read_tokens, 0) - COALESCE(m.cache_read_tokens, 0)
+                                ELSE 0 END) as cache_read_tokens,
+                       SUM(CASE WHEN COALESCE(s.reasoning_tokens, 0) > COALESCE(m.reasoning_tokens, 0)
+                                THEN COALESCE(s.reasoning_tokens, 0) - COALESCE(m.reasoning_tokens, 0)
+                                ELSE 0 END) as reasoning_tokens,
+                       SUM(CASE WHEN COALESCE(s.estimated_cost_usd, 0) > COALESCE(m.estimated_cost, 0)
+                                THEN COALESCE(s.estimated_cost_usd, 0) - COALESCE(m.estimated_cost, 0)
+                                ELSE 0 END) as estimated_cost,
+                       SUM(CASE WHEN COALESCE(s.actual_cost_usd, 0) > COALESCE(m.actual_cost, 0)
+                                THEN COALESCE(s.actual_cost_usd, 0) - COALESCE(m.actual_cost, 0)
+                                ELSE 0 END) as actual_cost,
+                       SUM(CASE WHEN m.session_id IS NULL THEN 1 ELSE 0 END) as sessions,
+                       SUM(CASE WHEN COALESCE(s.api_call_count, 0) > COALESCE(m.api_calls, 0)
+                                THEN COALESCE(s.api_call_count, 0) - COALESCE(m.api_calls, 0)
+                                ELSE 0 END) as api_calls,
+                       SUM(COALESCE(s.tool_call_count, 0)) as tool_calls,
+                       MAX(s.started_at) as last_used_at,
+                       0 as avg_tokens_per_session
+                FROM sessions s
+                LEFT JOIN (
+                    SELECT session_id,
+                           SUM(input_tokens) as input_tokens,
+                           SUM(output_tokens) as output_tokens,
+                           SUM(cache_read_tokens) as cache_read_tokens,
+                           SUM(reasoning_tokens) as reasoning_tokens,
+                           COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                           COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                           SUM(COALESCE(api_call_count, 0)) as api_calls
+                    FROM session_model_usage
+                    WHERE task = ''
+                    GROUP BY session_id
+                ) m ON m.session_id = s.id
+                WHERE s.started_at > ? AND s.model IS NOT NULL AND s.model != ''
+                GROUP BY s.model, s.billing_provider
+            """, cutoff)
+        except Exception:
+            residual = _rows(db, """
+                SELECT model,
+                       billing_provider,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       SUM(cache_read_tokens) as cache_read_tokens,
+                       SUM(reasoning_tokens) as reasoning_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                       COUNT(*) as sessions,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls,
+                       SUM(tool_call_count) as tool_calls,
+                       MAX(started_at) as last_used_at,
+                       AVG(input_tokens + output_tokens) as avg_tokens_per_session
+                FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
+                GROUP BY model, billing_provider
+            """, cutoff)
+        residual = [
+            row for row in residual
+            if any((row.get(k) or 0) != 0 for k in _USAGE_KEYS) or (row.get("sessions") or 0)
+        ]
+        raw_rows = _merge_usage_rows(raw_rows, residual)
 
         # Aux-only models (dedicated vision/compression) as (model, provider) rows,
         # keyed like the GROUP BY above, so they appear on the Models page.
@@ -265,7 +431,61 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
                 "aux_task": aux.get("task") or "",
             })
 
-        rows = _fold_session_only_rows(raw_rows)
+        # Aux usage may share the main model/provider. Merge once more after
+        # appending it so one billing identity always produces one card.
+        rows = _fold_session_only_rows(_merge_usage_rows([], raw_rows))
+
+        # Aggregated main/aux rows each carry their own DISTINCT session count.
+        # Recompute across their union so one physical session is counted once
+        # per model/provider card, while retaining absolute-only session routes.
+        session_count_rows = _rows(db, """
+            WITH main_usage AS (
+                SELECT session_id,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       SUM(cache_read_tokens) as cache_read_tokens,
+                       SUM(reasoning_tokens) as reasoning_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls
+                FROM session_model_usage
+                WHERE task = ''
+                GROUP BY session_id
+            ), card_sessions AS (
+                SELECT u.model, u.billing_provider, u.session_id
+                FROM session_model_usage u
+                JOIN sessions s ON s.id = u.session_id
+                WHERE s.started_at > ? AND u.model IS NOT NULL AND u.model != ''
+                UNION
+                SELECT s.model, s.billing_provider, s.id
+                FROM sessions s
+                LEFT JOIN main_usage m ON m.session_id = s.id
+                WHERE s.started_at > ? AND s.model IS NOT NULL AND s.model != ''
+                  AND (
+                    COALESCE(s.input_tokens, 0) > COALESCE(m.input_tokens, 0)
+                    OR COALESCE(s.output_tokens, 0) > COALESCE(m.output_tokens, 0)
+                    OR COALESCE(s.cache_read_tokens, 0) > COALESCE(m.cache_read_tokens, 0)
+                    OR COALESCE(s.reasoning_tokens, 0) > COALESCE(m.reasoning_tokens, 0)
+                    OR COALESCE(s.estimated_cost_usd, 0) > COALESCE(m.estimated_cost, 0)
+                    OR COALESCE(s.actual_cost_usd, 0) > COALESCE(m.actual_cost, 0)
+                    OR COALESCE(s.api_call_count, 0) > COALESCE(m.api_calls, 0)
+                    OR COALESCE(s.tool_call_count, 0) > 0
+                  )
+            )
+            SELECT model, billing_provider, COUNT(DISTINCT session_id) as sessions
+            FROM card_sessions
+            GROUP BY model, billing_provider
+        """, cutoff, cutoff)
+        session_counts = {
+            (row.get("model") or "", row.get("billing_provider") or ""): row.get("sessions") or 0
+            for row in session_count_rows
+        }
+        for row in rows:
+            key = (row.get("model") or "", row.get("billing_provider") or "")
+            if key in session_counts:
+                row["sessions"] = session_counts[key]
+                total_tokens = (row.get("input_tokens") or 0) + (row.get("output_tokens") or 0)
+                row["avg_tokens_per_session"] = total_tokens / row["sessions"] if row["sessions"] else 0
         rows.sort(
             key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
             reverse=True,
@@ -306,3 +526,167 @@ async def get_models_analytics(
 ):
     """Return model analytics without blocking the serving event loop."""
     return await asyncio.to_thread(_get_models_analytics, days, profile)
+
+
+_CAPACITY_TTL_S = 30.0
+_capacity_lock = threading.Lock()
+_capacity_snapshots: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_capacity_inflight: Dict[str, Future] = {}
+
+
+def reset_provider_capacity_cache() -> None:
+    with _capacity_lock:
+        _capacity_snapshots.clear()
+
+
+def _list_capacity_providers(profile: Optional[str] = None) -> List[str]:
+    """Configured + recently billed providers (deduped, no empty names)."""
+    names: List[str] = []
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.models import normalize_provider
+
+        with _config_profile_scope(profile):
+            cfg = load_config() or {}
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(model_cfg, dict):
+            raw = str(model_cfg.get("provider") or "").strip()
+            if raw:
+                names.append(normalize_provider(raw) or raw)
+    except Exception:
+        pass
+    try:
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            cutoff = time.time() - (30 * 86400)
+            rows = db._conn.execute(
+                """
+                SELECT billing_provider FROM (
+                    SELECT u.billing_provider AS billing_provider
+                    FROM session_model_usage u
+                    JOIN sessions s ON s.id = u.session_id
+                    WHERE s.started_at > ? AND COALESCE(u.billing_provider, '') != ''
+                    UNION
+                    SELECT s.billing_provider AS billing_provider
+                    FROM sessions s
+                    WHERE s.started_at > ? AND COALESCE(s.billing_provider, '') != ''
+                )
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+            for row in rows:
+                val = str(row[0] if not isinstance(row, dict) else row.get("billing_provider") or "").strip()
+                if val:
+                    names.append(val)
+        finally:
+            db.close()
+    except Exception:
+        pass
+    out: List[str] = []
+    seen = set()
+    for name in names:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _capacity_window_dict(window: Any) -> Dict[str, Any]:
+    reset = getattr(window, "reset_at", None)
+    return {
+        "label": getattr(window, "label", ""),
+        "used_percent": getattr(window, "used_percent", None),
+        "reset_at": reset.isoformat() if reset is not None else None,
+        "detail": getattr(window, "detail", None),
+    }
+
+
+def _fetch_one_capacity(provider: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    from agent.account_usage import fetch_account_usage
+
+    try:
+        # Worker threads do not inherit the request's contextvars. Establish
+        # the selected profile inside each worker before credentials/config load.
+        with _config_profile_scope(profile):
+            snap = fetch_account_usage(provider)
+    except Exception as exc:
+        return {
+            "id": provider,
+            "windows": [],
+            "fetched_at": None,
+            "unavailable_reason": str(exc),
+            "plan": None,
+            "details": [],
+        }
+    if snap is None:
+        return {
+            "id": provider,
+            "windows": [],
+            "fetched_at": None,
+            "unavailable_reason": "no snapshot",
+            "plan": None,
+            "details": [],
+        }
+    fetched = getattr(snap, "fetched_at", None)
+    return {
+        "id": provider,
+        "windows": [_capacity_window_dict(w) for w in (snap.windows or ())],
+        "fetched_at": fetched.isoformat() if fetched is not None else None,
+        "unavailable_reason": snap.unavailable_reason,
+        "plan": snap.plan,
+        "details": list(snap.details or ()),
+        "title": snap.title,
+    }
+
+
+def _compute_provider_capacity(profile: Optional[str] = None) -> Dict[str, Any]:
+    providers = _list_capacity_providers(profile)
+    rows: List[Dict[str, Any]] = []
+    if providers:
+        workers = min(8, len(providers))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_fetch_one_capacity, p, profile) for p in providers]
+            for fut in as_completed(futs):
+                rows.append(fut.result())
+    rows.sort(key=lambda r: r.get("id") or "")
+    return {"providers": rows, "fetched_at": time.time(), "cached": False}
+
+
+def _get_provider_capacity(profile: Optional[str] = None) -> Dict[str, Any]:
+    cache_key = (profile or "").strip().lower()
+    now = time.monotonic()
+    with _capacity_lock:
+        snapshot = _capacity_snapshots.get(cache_key)
+        if snapshot and (now - snapshot[0]) < _CAPACITY_TTL_S:
+            payload = dict(snapshot[1])
+            payload["cached"] = True
+            return payload
+        refresh = _capacity_inflight.get(cache_key)
+        leader = refresh is None
+        if leader:
+            refresh = Future()
+            _capacity_inflight[cache_key] = refresh
+    if not leader:
+        payload = dict(refresh.result())
+        payload["cached"] = True
+        return payload
+    try:
+        computed = _compute_provider_capacity(profile)
+    except BaseException as exc:
+        with _capacity_lock:
+            _capacity_inflight.pop(cache_key, None)
+            refresh.set_exception(exc)
+        raise
+    with _capacity_lock:
+        _capacity_snapshots[cache_key] = (time.monotonic(), computed)
+        _capacity_inflight.pop(cache_key, None)
+        refresh.set_result(computed)
+    return dict(computed)
+
+
+@router.get("/api/analytics/provider-capacity")
+async def get_provider_capacity(profile: Optional[str] = None):
+    """Live provider allowance windows (Codex/OpenRouter/etc), TTL-cached 30s."""
+    return await asyncio.to_thread(_get_provider_capacity, profile)

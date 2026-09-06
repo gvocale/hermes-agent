@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Brain,
@@ -14,6 +14,8 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { ProfileContext } from "@/contexts/profile-context";
+import { createCapacityRefresh } from "@/lib/capacity-refresh";
 import type {
   AuxiliaryModelsResponse,
   AuxiliaryTaskAssignment,
@@ -21,6 +23,7 @@ import type {
   MoaModelSlot,
   ModelsAnalyticsModelEntry,
   ModelsAnalyticsResponse,
+  ProviderCapacityResponse,
 } from "@/lib/api";
 import { timeAgo, cn, themedBody } from "@/lib/utils";
 import {
@@ -1120,6 +1123,100 @@ function ModelSettingsPanel({
 }
 
 /* ──────────────────────────────────────────────────────────────────── */
+/*  Live provider capacity (allowance windows)                         */
+/* ──────────────────────────────────────────────────────────────────── */
+
+function agoLabel(epochSec: number): string {
+  const sec = Math.max(0, Math.floor(Date.now() / 1000 - epochSec));
+  if (sec < 5) return "just now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  return `${Math.floor(min / 60)}h ago`;
+}
+
+function CapacitySection() {
+  const [cap, setCap] = useState<ProviderCapacityResponse | null>(null);
+  const { profile } = useContext(ProfileContext);
+
+  useEffect(() => {
+    const refresh = createCapacityRefresh(
+      () => api.getProviderCapacity(profile),
+      setCap,
+    );
+    void refresh.run();
+    let timer: number | undefined;
+    const tick = () => {
+      if (document.visibilityState === "visible") void refresh.run();
+      timer = window.setTimeout(tick, 30_000);
+    };
+    timer = window.setTimeout(tick, 30_000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void refresh.run();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVis);
+      refresh.dispose();
+    };
+  }, [profile]);
+
+  if (!cap || cap.providers.length === 0) return null;
+
+  return (
+    <Card className="min-w-0 max-w-full">
+      <CardHeader>
+        <CardTitle className="text-base">Model Capacity</CardTitle>
+        <p className="text-xs text-text-tertiary">
+          Live provider allowance. Updated {agoLabel(cap.fetched_at)}
+          {cap.cached ? " (cached)" : ""}.
+        </p>
+      </CardHeader>
+      <CardContent className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {cap.providers.map((row) => (
+          <div
+            key={row.id}
+            className="min-w-0 border border-border/40 bg-card/40 px-3 py-2 space-y-2"
+          >
+            <div className="text-sm font-mono truncate">{row.id}</div>
+            {row.unavailable_reason ? (
+              <p className="text-xs text-text-tertiary">{row.unavailable_reason}</p>
+            ) : (
+              row.windows.map((w) => {
+                const used = w.used_percent ?? 0;
+                const remaining = Math.max(0, Math.round(100 - used));
+                return (
+                  <div key={w.label} className="space-y-1">
+                    <div className="flex justify-between text-xs text-text-secondary">
+                      <span>{w.label}</span>
+                      <span>
+                        {remaining}% remaining
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden bg-muted">
+                      <div
+                        className="h-full bg-primary"
+                        style={{ width: `${Math.min(100, Math.max(0, used))}%` }}
+                      />
+                    </div>
+                    {w.reset_at && (
+                      <div className="text-xs text-text-tertiary">
+                        resets {w.reset_at}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────────── */
 /*  Page                                                                */
 /* ──────────────────────────────────────────────────────────────────── */
 
@@ -1242,6 +1339,8 @@ export default function ModelsPage() {
   return (
     <div className="flex min-w-0 max-w-full flex-col gap-6">
       <PluginSlot name="models:top" />
+
+      <CapacitySection />
 
       <div className="grid min-w-0 gap-6 lg:grid-cols-2">
         <ModelSettingsPanel

@@ -824,6 +824,7 @@ export interface AnalyticsModelEntry {
   input_tokens: number
   model: string
   output_tokens: number
+  provider?: string
   sessions: number
 }
 

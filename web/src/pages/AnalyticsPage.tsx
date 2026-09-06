@@ -320,11 +320,14 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
             <tbody>
               {sorted.map((m) => (
                 <tr
-                  key={m.model}
+                  key={`${m.model}\u0000${m.provider ?? ""}`}
                   className="border-b border-border/50 hover:bg-secondary/20 transition-colors"
                 >
                   <td className="py-2 pr-4">
                     <span className="font-mono-ui text-xs">{m.model}</span>
+                    {m.provider ? (
+                      <span className="ml-2 text-xs text-muted-foreground">{m.provider}</span>
+                    ) : null}
                   </td>
                   <td className="text-right py-2 px-4 text-muted-foreground">
                     {m.sessions}

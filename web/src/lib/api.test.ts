@@ -119,6 +119,22 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.getProviderCapacity", () => {
+  it("keeps provider capacity on the selected management profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ providers: [], fetched_at: 1, cached: false });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("worker");
+
+    await api.getProviderCapacity();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/analytics/provider-capacity?profile=worker",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

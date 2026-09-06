@@ -519,6 +519,10 @@ export const api = {
     fetchJSON<ModelsAnalyticsResponse>(
       appendProfileParam(`/api/analytics/models?days=${days}`, profile),
     ),
+  getProviderCapacity: (profile = getManagementProfile()) =>
+    fetchJSON<ProviderCapacityResponse>(
+      appendProfileParam("/api/analytics/provider-capacity", profile),
+    ),
   getConfig: (profile = getManagementProfile()) =>
     fetchJSON<Record<string, unknown>>(appendProfileParam("/api/config", profile)),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
@@ -2122,6 +2126,7 @@ export interface AnalyticsDailyEntry {
 
 export interface AnalyticsModelEntry {
   model: string;
+  provider?: string;
   input_tokens: number;
   output_tokens: number;
   estimated_cost: number;
@@ -2216,6 +2221,29 @@ export interface ModelsAnalyticsModelEntry {
     max_output_tokens?: number;
     model_family?: string;
   };
+}
+
+export interface ProviderCapacityWindow {
+  label: string;
+  used_percent: number | null;
+  reset_at: string | null;
+  detail: string | null;
+}
+
+export interface ProviderCapacityRow {
+  id: string;
+  windows: ProviderCapacityWindow[];
+  fetched_at: string | null;
+  unavailable_reason: string | null;
+  plan?: string | null;
+  details?: string[];
+  title?: string;
+}
+
+export interface ProviderCapacityResponse {
+  providers: ProviderCapacityRow[];
+  fetched_at: number;
+  cached: boolean;
 }
 
 export interface ModelsAnalyticsResponse {

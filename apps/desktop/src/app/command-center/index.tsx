@@ -644,8 +644,8 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
         <UsageList
           emptyLabel={cc.noModelUsage}
           rows={byModel.slice(0, 6).map(entry => ({
-            key: entry.model,
-            label: entry.model,
+            key: `${entry.model}\u0000${entry.provider ?? ''}`,
+            label: entry.provider ? `${entry.model} · ${entry.provider}` : entry.model,
             value: `${compactNumber((entry.input_tokens || 0) + (entry.output_tokens || 0))}`
           }))}
           title={cc.topModels}
