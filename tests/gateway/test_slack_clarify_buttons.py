@@ -135,6 +135,74 @@ class TestSlackSendClarify:
 
 
     @pytest.mark.asyncio
+    async def test_long_choices_are_explained_above_short_reference_buttons(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.0"})
+        choices = [
+            "Switch the operator advisor to gpt-5.6-luna, retry all nine decisions, and verify Slack delivery (Recommended)",
+            "Keep gpt-5.6-sol and raise the timeout to fifteen minutes before retrying all nine decisions",
+        ]
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="How should I finish recovery?",
+            choices=choices,
+            clarify_id="cid-long",
+            session_key="sk-long",
+        )
+
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        explanations = "\n".join(
+            block["text"]["text"] for block in blocks if block["type"] == "section")
+        assert "How should I finish recovery?" in explanations
+        assert "*Option 1*" in explanations
+        assert choices[0] in explanations
+        assert choices[1] in explanations
+        labels = [element["text"]["text"] for element in blocks[-1]["elements"]]
+        assert labels == ["Option 1", "Option 2", "✏️ Other…"]
+
+    @pytest.mark.asyncio
+    async def test_each_long_choice_keeps_its_own_section_budget(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.0"})
+        choices = ["A" * 2000, "B" * 2000]
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Choose one",
+            choices=choices,
+            clarify_id="cid-large",
+            session_key="sk-large",
+        )
+
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        section_texts = [block["text"]["text"] for block in blocks if block["type"] == "section"]
+        assert choices[0] in section_texts[1]
+        assert choices[1] in section_texts[2]
+        assert [element["text"]["text"] for element in blocks[-1]["elements"]] == [
+            "Option 1", "Option 2", "✏️ Other…"]
+
+    @pytest.mark.asyncio
+    async def test_recommended_suffix_does_not_make_a_short_choice_long(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.0"})
+
+        await adapter.send_clarify(
+            chat_id="C1",
+            question="Choose one",
+            choices=["Use Luna for retries (Recommended)", "Keep Sol"],
+            clarify_id="cid-recommended",
+            session_key="sk-recommended",
+        )
+
+        blocks = mock_client.chat_postMessage.call_args[1]["blocks"]
+        labels = [element["text"]["text"] for element in blocks[1]["elements"]]
+        assert labels == ["Use Luna for retries (Recommended)", "Keep Sol", "✏️ Other…"]
+
+    @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]

@@ -243,8 +243,9 @@ CLARIFY_SCHEMA = {
         f"in `questions` (1-{MAX_QUESTIONS} entries) — a single question is a "
         "one-entry array, and several INDEPENDENT questions belong in ONE "
         "call (one form beats a chain of clarify calls; if one answer would "
-        "change another question, ask separately). Per question: "
-        f"single-select (up to {MAX_CHOICES} choices — put your recommended "
+        "change another question, ask separately). Explain every option's "
+        "complete meaning and consequence in the question text. Per question: "
+        f"single-select (up to {MAX_CHOICES} short choices — put your recommended "
         "option FIRST, the UI marks it '(Recommended)' and auto-appends an "
         "'Other' free-text row), multi-select (multi_select=true), or "
         "open-ended (omit choices). Options go ONLY in `choices`, never "
@@ -271,10 +272,17 @@ CLARIFY_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "question": {"type": "string"},
+                        "question": {
+                            "type": "string",
+                            "description": (
+                                "The question and context. For decisions, include every option's "
+                                "complete meaning and consequence here."
+                            ),
+                        },
                         "choices": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "description": "Short button labels that refer to the explained options.",
+                            "items": {"type": "string", "maxLength": 30},
                             "maxItems": MAX_CHOICES,
                         },
                         "multi_select": {"type": "boolean"},

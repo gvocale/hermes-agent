@@ -5269,26 +5269,48 @@ class SlackAdapter(BasePlatformAdapter):
                 session_key=session_key, metadata=metadata)
 
         def _build() -> Tuple[str, list]:
-            # Escape mrkdwn control chars so the question renders literally;
-            # budget against the 3000-char section cap.
-            q = (question or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            # Escape mrkdwn control chars so the prompt renders literally. Long choices are
+            # decision explanations, not usable button labels: render them in the section and
+            # make each button a short positional reference. The action value still carries the
+            # index, so resolving a click returns the original choice unchanged.
+            def _escape(text: str) -> str:
+                return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            q = _escape(question or "")
+            labels = [str(choice).strip() or f"Option {idx + 1}" for idx, choice in enumerate(choices)]
+            recommendation = " (Recommended)"
+            semantic_labels = [
+                label[:-len(recommendation)] if label.casefold().endswith(recommendation.casefold()) else label
+                for label in labels
+            ]
+            explain_choices = any(len(label) > 30 for label in semantic_labels)
             body = f"❓ {q}"
+            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}}]
+            if explain_choices:
+                for idx, label in enumerate(labels):
+                    option = f"*Option {idx + 1}*\n{_escape(label)}"
+                    blocks.append({
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": option[:3000]},
+                    })
+                fallback_options = "\n".join(
+                    f"{idx + 1}. {_escape(label)}" for idx, label in enumerate(labels))
+                body = f"{body}\n\n{fallback_options}"
             budget = 3000 - len("...")
             if len(body) > budget:
                 body = body[:budget] + "..."
             # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
             # chunk anyway so larger lists degrade gracefully instead of 400ing.
             elements = []
-            for idx, choice in enumerate(choices):
-                label = str(choice).strip() or f"Option {idx + 1}"
+            for idx, label in enumerate(labels):
+                button_label = f"Option {idx + 1}" if explain_choices else label
                 elements.append(
                     self._button(
-                        label[:75], f"hermes_clarify_choice_{idx}",
+                        button_label, f"hermes_clarify_choice_{idx}",
                         f"{clarify_id}|{idx}", emoji=True))
             elements.append(
                 self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
             )
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start : start + 5]})
             return body, blocks

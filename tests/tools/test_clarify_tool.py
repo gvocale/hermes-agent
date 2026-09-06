@@ -186,6 +186,14 @@ class TestClarifySchema:
         assert "question" not in params["properties"]
 
 
+    def test_schema_keeps_decision_details_out_of_choice_labels(self):
+        """Decision consequences belong in the question; controls stay glanceable."""
+        question = CLARIFY_SCHEMA["parameters"]["properties"]["questions"]["items"]
+        choice_item = question["properties"]["choices"]["items"]
+        assert choice_item["maxLength"] <= 30
+        assert "complete" in question["properties"]["question"]["description"].lower()
+
+
 class TestClarifyToolMultiSelect:
     """Tests for multi_select (checkbox) support added to clarify_tool."""
 
