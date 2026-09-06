@@ -5,6 +5,7 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 """
 
 import asyncio
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -21,6 +22,7 @@ from hermes_cli.web_server_profiles import (
 from hermes_cli.web_models import RawConfigUpdate
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.web_server_sessions")
@@ -611,12 +613,13 @@ def _fetch_one_capacity(provider: str, profile: Optional[str] = None) -> Dict[st
         # the selected profile inside each worker before credentials/config load.
         with _config_profile_scope(profile):
             snap = fetch_account_usage(provider)
-    except Exception as exc:
+    except Exception:
+        logger.exception("Provider capacity fetch failed for %s", provider)
         return {
             "id": provider,
             "windows": [],
             "fetched_at": None,
-            "unavailable_reason": str(exc),
+            "unavailable_reason": "capacity unavailable",
             "plan": None,
             "details": [],
         }

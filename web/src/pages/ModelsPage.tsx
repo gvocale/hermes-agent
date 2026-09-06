@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { ProfileContext } from "@/contexts/profile-context";
-import { createCapacityRefresh } from "@/lib/capacity-refresh";
+import { capacityPercentages, createCapacityRefresh } from "@/lib/capacity-refresh";
 import type {
   AuxiliaryModelsResponse,
   AuxiliaryTaskAssignment,
@@ -1184,20 +1184,19 @@ function CapacitySection() {
               <p className="text-xs text-text-tertiary">{row.unavailable_reason}</p>
             ) : (
               row.windows.map((w) => {
-                const used = w.used_percent ?? 0;
-                const remaining = Math.max(0, Math.round(100 - used));
+                const percentages = capacityPercentages(w.used_percent);
                 return (
                   <div key={w.label} className="space-y-1">
                     <div className="flex justify-between text-xs text-text-secondary">
                       <span>{w.label}</span>
                       <span>
-                        {remaining}% remaining
+                        {percentages ? `${percentages.remaining}% remaining` : "unavailable"}
                       </span>
                     </div>
                     <div className="h-1.5 w-full overflow-hidden bg-muted">
                       <div
                         className="h-full bg-primary"
-                        style={{ width: `${Math.min(100, Math.max(0, used))}%` }}
+                        style={{ width: `${percentages?.used ?? 0}%` }}
                       />
                     </div>
                     {w.reset_at && (

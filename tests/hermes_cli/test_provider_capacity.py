@@ -154,3 +154,14 @@ def test_provider_capacity_concurrent_callers_share_one_refresh(monkeypatch):
 
     assert calls["n"] == 1
     assert sorted(result["cached"] for result in results) == [False, True]
+
+
+def test_provider_capacity_sanitizes_fetch_exceptions(monkeypatch):
+    def fake_fetch(provider):
+        raise RuntimeError("request failed for https://private.example/token")
+
+    monkeypatch.setattr("agent.account_usage.fetch_account_usage", fake_fetch)
+    row = analytics_mod._fetch_one_capacity("anthropic")
+
+    assert row["unavailable_reason"] == "capacity unavailable"
+    assert "private.example" not in row["unavailable_reason"]

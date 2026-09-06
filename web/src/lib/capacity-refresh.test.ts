@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createCapacityRefresh } from "./capacity-refresh";
+import { createCapacityRefresh, capacityPercentages } from "./capacity-refresh";
+
+describe("capacityPercentages", () => {
+  it("keeps unknown capacity unavailable instead of reporting 100% remaining", () => {
+    expect(capacityPercentages(null)).toBeNull();
+    expect(capacityPercentages(40)).toEqual({ used: 40, remaining: 60 });
+  });
+});
 
 describe("createCapacityRefresh", () => {
   it("coalesces overlapping refreshes and ignores results after disposal", async () => {
