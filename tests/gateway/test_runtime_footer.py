@@ -161,6 +161,32 @@ def test_build_footer_adds_model_emoji_only_for_slack():
     assert build_footer_line(platform_key="discord", **common) == "gpt-5.6-sol"
 
 
+def test_slack_openai_model_footer_keeps_effective_reasoning_effort():
+    config = {
+        "display": {
+            "platforms": {
+                "slack": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": ["model", "reasoning", "context_pct", "latency"],
+                    }
+                }
+            }
+        }
+    }
+
+    out = build_footer_line(
+        user_config=config,
+        platform_key="slack",
+        model="gpt-6-astra",
+        context_tokens=54_000,
+        context_length=100_000,
+        turn_seconds=37,
+        reasoning="low",
+    )
+
+    assert out == ":openai: gpt-6-astra · low · 54% · 37s"
+
 
 # ---------------------------------------------------------------------------
 # latency — opt-in wall-clock turn duration
