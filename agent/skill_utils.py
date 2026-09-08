@@ -64,10 +64,14 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
 
 
 def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
-    """True if *path* should be skipped by skill scanners (VCS/dependency/cache
-    dirs + support packages). Apply to every SKILL.md from a direct ``rglob``."""
-    parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(path, root=root)
+    """Exclude storage and support packages, using lexical paths, not link targets.
+    Pass the discovery root for absolute paths so hidden ancestors like .hermes
+    do not hide the whole installation (public links into hidden storage work)."""
+    path_obj = PurePath(str(path))
+    relative = path_obj.relative_to(root) if root is not None and path_obj.is_absolute() else path_obj
+    parts = relative.parts
+    hidden = not relative.is_absolute() and any(part.startswith(".") for part in parts)
+    return hidden or any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(path, root=root)
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
@@ -733,25 +737,47 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
     return len(_normalize_skill_description(frontmatter)) > SKILL_PROMPT_DESC_LIMIT
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
-    """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots. Org mirrors are
+def iter_skill_index_files(skills_dir: Path, filename: str, *, deduplicate: bool = True):
+    """Walk public lexical paths, yielding one sorted path per canonical file.
+    Resolution uses ``deduplicate=False`` to match every directory alias before
+    deduplicating candidates. Ancestor identity stops cycles in either mode.
+    Prunes hidden/storage dirs and support dirs of skill roots. Org mirrors are
     TOKEN-GATED: only the active org's subdir is walked, so leaving an org
     stops its skills resolving without manual cleanup."""
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
+    ancestors: list[Path] = []
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        depth = len(Path(root).relative_to(skills_dir).parts)
+        del ancestors[depth:]
+        try:
+            canonical_dir = Path(root).resolve(strict=True)
+        except (OSError, RuntimeError):
+            dirs[:] = []
+            continue
+        if canonical_dir in ancestors:
+            dirs[:] = []
+            continue
+        ancestors.append(canonical_dir)
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))
-    yield from map(Path, sorted(matches))
+    seen: set[Path] = set()
+    for path in map(Path, sorted(matches)):
+        try:
+            canonical_file = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not deduplicate or canonical_file not in seen:
+            seen.add(canonical_file)
+            yield path
 
 
 # Namespace helpers for plugin-provided skills.

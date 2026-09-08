@@ -21,9 +21,9 @@ from hermes_constants import (
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS, ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE, SKILL_SUPPORT_DIRS,
+    ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE,
     extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_disabled_skill_names,
-    iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_environment,
+    iter_skill_index_files, parse_frontmatter, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
@@ -1081,28 +1081,19 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     """mtime/size manifest of every SKILL.md and DESCRIPTION.md; only the ACTIVE org mirror participates, and
     the ``.active_org`` marker is included so switching/leaving an org invalidates the snapshot by itself."""
     manifest: dict[str, list[int]] = {}
-    skills_dir_str = str(skills_dir)
-    prefix_len = len(os.path.join(skills_dir_str, ""))
-    active_org = read_active_org_id(skills_dir)
-    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
+    org_root = skills_dir / ORG_MIRROR_DIR_NAME
     try:
-        st = os.stat(os.path.join(org_root, ORG_ACTIVE_MARKER))
+        st = (org_root / ORG_ACTIVE_MARKER).stat()
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [int(st.st_mtime), int(st.st_size)]
     except OSError:
         pass
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
-        has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
-            dirs.remove(ORG_MIRROR_DIR_NAME)
-        elif root == org_root:
-            dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
-        for filename in ("SKILL.md", "DESCRIPTION.md"):
-            path = os.path.join(root, filename)
+    # The manifest must use the same namespace as discovery. Old snapshots
+    # containing storage copies/aliases then fail the manifest comparison.
+    for filename in ("SKILL.md", "DESCRIPTION.md"):
+        for path in iter_skill_index_files(skills_dir, filename):
             try:
-                if filename in files:
-                    st = os.stat(path)
-                    manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
+                st = path.stat()
+                manifest[str(path.relative_to(skills_dir))] = [st.st_mtime_ns, st.st_size]
             except OSError:
                 pass
     return manifest
