@@ -321,7 +321,7 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
     Collision detection is the point: silent shadowing of a local skill by a same-named
     external one is a real bug class, so the caller refuses >1."""
-    from agent.skill_utils import iter_skill_index_files
+    from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
     candidates: List[Tuple[Optional[Path], Path]] = []
     seen_md: set = set()
 
@@ -333,26 +333,26 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
             seen_md.add(key)
             candidates.append((sd, smd))
 
-    def _record_direct(direct_path: Path) -> None:  # "mlops/axolotl" / "axolotl" or its flat .md sibling
+    def _record_direct(direct_path: Path, search_dir: Path) -> None:  # "mlops/axolotl" / "axolotl" or its flat .md sibling
         flat = direct_path.with_suffix(".md")
-        if not _is_skill_support_path(direct_path) and direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+        if not is_excluded_skill_path(direct_path, root=search_dir) and direct_path.is_dir() and (direct_path / "SKILL.md").exists():
             _record(direct_path, direct_path / "SKILL.md")
-        elif flat.exists() and not _is_skill_support_path(flat):
+        elif flat.exists() and not is_excluded_skill_path(flat, root=search_dir):
             _record(None, flat)
 
     for search_dir in all_dirs:
         for direct in filter(None, (name, local_category_name)):  # "p:x" with no plugin p → "p/x"
-            _record_direct(search_dir / direct)
+            _record_direct(search_dir / direct, search_dir)
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
-        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md", deduplicate=False):
             if (found_skill_md.parent.name == name
                     or _safe_frontmatter(found_skill_md).get("name") == name):
                 _record(found_skill_md.parent, found_skill_md)
         # Legacy flat <name>.md anywhere under the dir; support docs are excluded
         # (they load via file_path and must not shadow real skills sharing the basename).
         for found_md in search_dir.rglob(f"{name}.md"):
-            if found_md.name != "SKILL.md" and not _is_skill_support_path(found_md):
+            if found_md.name != "SKILL.md" and not is_excluded_skill_path(found_md, root=search_dir):
                 _record(None, found_md)
     return candidates
 
