@@ -1200,10 +1200,21 @@ class TurnRunner:
                 flush(timeout=3.0)
         except Exception:
             logger.debug("Stream-consumer flush before clarify prompt failed", exc_info=True)
+        # Notification identity belongs to the authenticated turn, never tool prose or
+        # shared progress metadata. A home/routed destination needs a separate binding.
+        metadata = dict(ctx._status_thread_metadata or {})
+        metadata.pop("clarify_recipient", None)
+        source = ctx.source
+        if (source and ctx._status_chat_id == source.chat_id
+                and ctx._status_adapter is self._runner._adapter_for_source(source)):
+            metadata["clarify_recipient"] = {
+                "platform": source.platform.value, "scope_id": source.scope_id,
+                "user_id": source.user_id, "chat_id": source.chat_id,
+            }
         fut = self._schedule(
             ctx._status_adapter.send_clarify(
                 chat_id=ctx._status_chat_id, question=question, choices=choices, clarify_id=clarify_id,
-                session_key=session_key, metadata=ctx._status_thread_metadata,
+                session_key=session_key, metadata=metadata or None,
             ),
             "Clarify send failed to schedule",
         )

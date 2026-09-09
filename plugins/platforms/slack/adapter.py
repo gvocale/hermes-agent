@@ -43,9 +43,9 @@ from gateway.platforms.base import (
     cache_document_from_bytes_async, cache_video_from_bytes_async)
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import bound_clarify_text, clarify_question, escape_clarify_text, render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import bound_clarify_text, clarify_question, escape_clarify_text, render_blocks, sanitize_blocks  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -5181,10 +5181,16 @@ class SlackAdapter(BasePlatformAdapter):
             # decision explanations, not usable button labels: render them in the section and
             # make each button a short positional reference. The action value still carries the
             # index, so resolving a click returns the original choice unchanged.
-            def _escape(text: str) -> str:
-                return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-            q = _escape(question or "")
+            # This legacy transport selects by channel, not metadata. Never mention a
+            # recipient when that actual destination is unknown, ambiguous or foreign.
+            team_id = self.scope_id_for_chat(chat_id)
+            if team_id not in self._team_clients:
+                team_id = None
+            explicit_team = self._metadata_team_id(metadata)
+            if explicit_team and explicit_team != team_id:
+                team_id = None
+            q = clarify_question(
+                question, (metadata or {}).get("clarify_recipient"), chat_id, team_id or "")
             labels = [str(choice).strip() or f"Option {idx + 1}" for idx, choice in enumerate(choices)]
             recommendation = " (Recommended)"
             semantic_labels = [
@@ -5192,21 +5198,19 @@ class SlackAdapter(BasePlatformAdapter):
                 for label in labels
             ]
             explain_choices = any(len(label) > 30 for label in semantic_labels)
-            body = f"❓ {q}"
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}}]
+            body = q
+            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
             if explain_choices:
                 for idx, label in enumerate(labels):
-                    option = f"*Option {idx + 1}*\n{_escape(label)}"
+                    option = f"*Option {idx + 1}*\n{escape_clarify_text(label)}"
                     blocks.append({
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": option[:3000]},
+                        "text": {"type": "mrkdwn", "text": bound_clarify_text(option)},
                     })
                 fallback_options = "\n".join(
-                    f"{idx + 1}. {_escape(label)}" for idx, label in enumerate(labels))
+                    f"{idx + 1}. {escape_clarify_text(label)}" for idx, label in enumerate(labels))
                 body = f"{body}\n\n{fallback_options}"
-            budget = 3000 - len("...")
-            if len(body) > budget:
-                body = body[:budget] + "..."
+            body = bound_clarify_text(body)
             # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
             # chunk anyway so larger lists degrade gracefully instead of 400ing.
             elements = []
@@ -5426,6 +5430,9 @@ class SlackAdapter(BasePlatformAdapter):
     async def _update_clarify_message(
         self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
+        # Only the saved question section is already rendered. Outcome prose is
+        # fresh untrusted data; escaping here must not alter canonical resolution.
+        decision_text = bound_clarify_text(escape_clarify_text(decision_text))
         await self._finalize_interactive_message(
             channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify", sanitize=False
         )

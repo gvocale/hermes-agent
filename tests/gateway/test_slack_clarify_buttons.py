@@ -306,6 +306,232 @@ class TestSlackClarifyOtherFlow:
         assert entry.event.is_set()
 
 
+# Synthetic data, real adapter methods, fake Slack transport. Historical cards
+# without recipient metadata retain literal prose through every lifecycle update.
+class TestSlackClarifyMentionContract:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def teardown_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["choice", "other", "expired"])
+    async def test_question_encoding_is_introduced_on_send_not_action(self, outcome):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.567890"})
+        mention = "<@U123ABCDE45>"
+        question = f"{mention} Apply the correction?"
+        choices = ["Apply correction", "Keep baseline"]
+        cm.register("mention-probe", "mention-session", question, choices)
+        try:
+            result = await adapter.send_clarify(
+                "C1", question, choices, "mention-probe", "mention-session")
+            assert result.success
+            sent = client.chat_postMessage.call_args.kwargs
+            original = sent["blocks"][0]["text"]["text"]
+            escaped = mention.replace("<", "&lt;").replace(">", "&gt;")
+            assert escaped in original and mention not in original
+            assert escaped in sent["text"]
+            assert mention in adapter.format_message(question)
+
+            if outcome == "expired":
+                _clear_clarify_state()
+            token = "other" if outcome == "other" else "0"
+            action_id = "hermes_clarify_other" if outcome == "other" else "hermes_clarify_choice_0"
+            await adapter._handle_clarify_action(AsyncMock(), {
+                "message": {"ts": result.message_id, "blocks": sent["blocks"]},
+                "channel": {"id": "C1"},
+                "user": {"name": "synthetic-user", "id": "U123ABCDE45"},
+            }, {"action_id": action_id, "value": f"mention-probe|{token}"})
+            updated = client.chat_update.call_args.kwargs
+            assert updated["blocks"][0]["text"]["text"] == original
+            assert "&amp;lt;" not in updated["blocks"][0]["text"]["text"]
+            if outcome == "choice":
+                assert cm._entries["mention-probe"].response == choices[0]
+                # The permalink reader joins decision fallback + question block;
+                # it does not introduce the entities seen in answered prompts.
+                readable = adapter._render_message_text(updated)
+                assert readable.startswith(f"✅ synthetic-user: {choices[0]}")
+                assert escaped in readable and mention not in readable
+
+            # A pre-encoded input adds another encoding layer at initial SEND.
+            await adapter.send_clarify(
+                "C1", question.replace(mention, escaped), choices,
+                "encoded-probe", "encoded-session")
+            encoded = client.chat_postMessage.call_args.kwargs["blocks"][0]["text"]["text"]
+            assert "&amp;lt;@U123ABCDE45&amp;gt;" in encoded
+        finally:
+            _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("surface", ["fallback", "section"])
+    async def test_intended_recipient_is_an_active_mention(self, surface):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.567890"})
+        mention = "<@U123ABCDE45>"
+        result = await adapter.send_clarify(
+            "C1", f"{mention} Apply the correction?", ["Apply", "Keep"],
+            "recipient-probe", "recipient-session", metadata={
+                "slack_team_id": "T1",
+                "clarify_recipient": {"platform": "slack", "scope_id": "T1",
+                                      "user_id": "U123ABCDE45", "chat_id": "C1"},
+            })
+        assert result.success
+        sent = client.chat_postMessage.call_args.kwargs
+        text = sent["text"] if surface == "fallback" else sent["blocks"][0]["text"]["text"]
+        assert mention in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["choice", "other", "expired"])
+@pytest.mark.parametrize("identity", ["trusted", "missing", "foreign", "malformed", "unknown", "conflicting"])
+async def test_clarify_recipient_is_the_only_active_syntax(outcome, identity):
+    import re
+    from tools import clarify_gateway as cm
+
+    _clear_clarify_state()
+    adapter = _make_adapter()
+    _attach_auth_runner(adapter)
+    client = adapter._team_clients["T1"]
+    # Exercise the legacy primary fallback too, without any network client.
+    adapter._app.client = client
+    client.chat_postMessage.return_value = {"ts": "1234.567890"}
+    recipient = {"platform": "slack", "scope_id": "T1", "user_id": "U123ABCDE45", "chat_id": "C1"}
+    metadata = {"clarify_recipient": recipient, "slack_team_id": "T1"}
+    recipient.update({
+        "foreign": {"scope_id": "T2"},
+        "malformed": {"user_id": "U123ABCDE45> <!here"},
+    }.get(identity, {}))
+    if identity == "missing":
+        metadata.pop("clarify_recipient")
+    if identity == "unknown":
+        adapter._channel_team.clear()
+    if identity == "conflicting":
+        metadata["slack_team_id"] = "T2"
+    prose = ('<@U123ABCDE45> <@UOTHER123|label> <!channel> <!here> <!everyone> '
+             '<!subteam^S123ABCD> `<@U123ABCDE45>` "> <@U123ABCDE45>" '
+             '<https://example.com|link> <A> & &lt;@U123ABCDE45&gt; '
+             '&amp;lt;@U123ABCDE45&amp;gt;')
+    # Force escaped entities across section/fallback boundaries, with Unicode.
+    question = prose + '🧪&' * 2000
+    choices = [prose + '🧪&' * 1000, "Keep"]
+    cm.register("security-card", "security-session", question, choices)
+    try:
+        result = await adapter.send_clarify("C1", question, choices, "security-card",
+                                            "security-session", metadata=metadata)
+        assert result.success
+        sent = client.chat_postMessage.call_args.kwargs
+        sections = [b["text"]["text"] for b in sent["blocks"] if b["type"] == "section"]
+        expected = ["<@U123ABCDE45>"] if identity == "trusted" else []
+        for text in (sent["text"], *sections):
+            assert len(text) <= 3000
+            assert not re.search(r"&(?!amp;|lt;|gt;)", text), "truncated escape entity"
+        for text in (sent["text"], sections[0]):
+            assert re.findall(r"<[^>]*>", text) == expected
+            assert "&lt;@U123ABCDE45&gt;" in text  # no prose-token stripping
+        assert all("<" not in text for text in sections[1:])
+        original = sections[0]
+        if outcome == "expired":
+            cm.clear_session("security-session")
+        action = {"action_id": "hermes_clarify_other" if outcome == "other" else "hermes_clarify_choice_0",
+                  "value": "security-card|other" if outcome == "other" else "security-card|0"}
+        body = {"message": {"ts": result.message_id, "blocks": sent["blocks"]},
+                "channel": {"id": "C1"}, "user": {"id": "U123ABCDE45", "name": "<!here> & user"}}
+        await adapter._handle_clarify_action(AsyncMock(), body, action)
+        updated = client.chat_update.call_args.kwargs
+        assert updated["blocks"][0]["text"]["text"] == original
+        for text in (updated["text"], updated["blocks"][1]["elements"][0]["text"]):
+            assert "<" not in text  # neither display name nor canonical answer can notify
+            assert len(text) <= 3000
+            assert not re.search(r"&(?!amp;|lt;|gt;)", text)
+        if outcome == "choice":
+            assert cm._entries["security-card"].response == choices[0]
+        # Duplicate interaction never re-edits or notifies.
+        count = client.chat_update.await_count
+        await adapter._handle_clarify_action(AsyncMock(), body, action)
+        assert client.chat_update.await_count == count
+    finally:
+        _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("chat_id,thread_id", [("C1", None), ("C1", "12.34"), ("D1", None)])
+@pytest.mark.parametrize("route", ["origin", "home-chat", "other-adapter", "missing-scope", "foreign-scope"])
+async def test_real_clarify_callback_binds_turn_recipient(native, chat_id, thread_id, route, monkeypatch):
+    import asyncio
+    import concurrent.futures
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.turn_context import TurnContext
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.session import SessionSource
+    from tools import clarify_gateway as cm
+
+    _clear_clarify_state()
+    adapter = _make_adapter()
+    client = adapter._team_clients["T1"]
+    client.chat_postMessage.return_value = {"ts": "1234.567890"}
+    adapter._channel_team[chat_id] = "T1"
+    source = SessionSource(platform=Platform.SLACK, chat_id=chat_id,
+                           scope_id="T1", user_id="U123ABCDE45", thread_id=thread_id)
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: adapter)
+    _, _, metadata = runner._run_agent_progress_threading(source, None, native)
+    destination_adapter, destination_chat = adapter, chat_id
+    if route == "home-chat":
+        destination_chat = "C2"
+        adapter._channel_team[destination_chat] = "T1"
+    elif route == "other-adapter":
+        destination_adapter = _make_adapter()
+        destination_adapter._channel_team[chat_id] = "T1"
+        client = destination_adapter._team_clients["T1"]
+        client.chat_postMessage.return_value = {"ts": "1234.567890"}
+    source.scope_id = {"missing-scope": None, "foreign-scope": "T2"}.get(route, source.scope_id)
+    # A cached progress recipient must never survive a routed clarification.
+    if route != "origin":
+        metadata = dict(metadata or {}, clarify_recipient={
+            "platform": "slack", "scope_id": "T1", "user_id": "U123ABCDE45", "chat_id": destination_chat})
+    consumer = MagicMock() if native else None
+    if consumer:
+        consumer._use_native_streaming = True
+        boundary = concurrent.futures.Future()
+        boundary.set_result(True)
+        consumer.close_for_approval_prompt.return_value = boundary
+    ctx = TurnContext(source=source, _status_adapter=destination_adapter, _status_chat_id=destination_chat,
+                          _status_thread_metadata=metadata, session_key="caller-session",
+                          _loop_for_step=asyncio.get_running_loop(),
+                          stream_consumer_holder=[consumer])
+    turn = TurnRunner(runner, ctx)
+    original_metadata = dict(metadata) if metadata else None
+
+    # Only replace the human wait; real callback registration, scheduling, adapter and
+    # payload rendering run, and the wait resolves the exact canonical choice.
+    def answer(clarify_id, timeout):
+        assert cm.resolve_gateway_clarify(clarify_id, "Keep")
+        return cm._entries[clarify_id].response
+
+    monkeypatch.setattr(cm, "wait_for_response", answer)
+    try:
+        result = await asyncio.to_thread(turn._clarify_callback_sync,
+                                         "<@UOTHER123> <!here> Choose?", ["Apply", "Keep"])
+        assert result == "Keep"
+        sent = client.chat_postMessage.call_args.kwargs
+        for text in (sent["text"], sent["blocks"][0]["text"]["text"]):
+            assert text.count("<@U123ABCDE45>") == (1 if route == "origin" else 0)
+            assert "<@UOTHER123>" not in text and "<!here>" not in text
+        assert sent.get("thread_ts") == thread_id
+        assert metadata == original_metadata  # no shared progress-state mutation
+    finally:
+        _clear_clarify_state()
+
+
 # ===========================================================================
 # Base text-fallback unchanged for platforms without an override (e)
 # ===========================================================================

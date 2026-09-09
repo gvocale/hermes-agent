@@ -42,6 +42,37 @@ MAX_TABLE_CHARS = 10000  # aggregate across all cells
 
 Block = Dict[str, Any]
 
+
+def escape_clarify_text(text: str) -> str:
+    """Neutralize Slack entities in prose, canonical choices and display names."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def bound_clarify_text(text: str) -> str:
+    """Bound already-escaped presentation without leaving a partial entity."""
+    if len(text) <= MAX_SECTION_TEXT:
+        return text
+    prefix = text[:MAX_SECTION_TEXT - 3]
+    return re.sub(r"&[^;]*$", "", prefix) + "..."
+
+
+def clarify_question(question: str, recipient: Any, chat_id: str, team_id: str) -> str:
+    """Only gateway-owned, destination-bound identity may become Slack syntax.
+
+    Prose (including a model's leading mention) stays literal; do not decode it.
+    ``team_id`` must describe the client actually used by the clarify transport.
+    """
+    heading = "❓ "
+    if (isinstance(recipient, dict) and team_id
+            and recipient.get("platform") == "slack"
+            and recipient.get("scope_id") == team_id
+            and recipient.get("chat_id") == chat_id):
+        user = recipient.get("user_id")
+        if isinstance(user, str) and re.fullmatch(r"[UW][A-Z0-9]{8,31}", user):
+            heading += f"<@{user}>\n"
+    return bound_clarify_text(heading + escape_clarify_text(question or ""))
+
+
 # ----------------------------------------------------------------------------
 # Line classification
 # ----------------------------------------------------------------------------
