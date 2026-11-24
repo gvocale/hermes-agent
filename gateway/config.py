@@ -280,6 +280,12 @@ class Platform(Enum):
             with contextlib.suppress(Exception):
                 from gateway.platform_registry import platform_registry
                 registered = platform_registry.is_registered(value)
+            if not registered:  # a left-core platform's old manifest key (``qqbot-platform``), as above
+                with contextlib.suppress(Exception):
+                    from hermes_cli.left_core_migration import legacy_platform_alias
+                    target = legacy_platform_alias(value)
+                    if target and target != value:
+                        return cls(target)
         return cls._add_pseudo_member(value) if registered else None
 
     @classmethod

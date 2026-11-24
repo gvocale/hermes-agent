@@ -90,6 +90,10 @@ def _merged_platform_block(home: Path, name: str) -> Optional[dict]:
         managed, managed.get("gateway"), {}, also=frozenset({name}))
     config_loader._apply_managed_extra(authored, managed, platforms)
     block = platforms.get(name)
+    old = next((platforms[a] for a in _platform_aliases(name) if isinstance(platforms.get(a), dict)), None)
+    if old is not None:  # core resolved the old manifest key to the same platform; the canonical key wins
+        block = {**old, **(block if isinstance(block, dict) else {}),
+                 "extra": {**(old.get("extra") or {}), **((block or {}).get("extra") or {})}}
     root = yaml_cfg.get(name)
     if isinstance(root, dict):  # a top-level ``<name>:`` block, bridged as bridge_platform_shared_keys does: its
         from gateway.config import PlatformConfig  # adapter keys beat gateway.json's extra, not config.yaml's nested one
@@ -99,6 +103,10 @@ def _merged_platform_block(home: Path, name: str) -> Optional[dict]:
         if "enabled" in root:  # and its enabled wins
             block["enabled"] = root["enabled"]
     return block if isinstance(block, dict) else None
+
+
+def _platform_aliases(platform: str) -> tuple[str, ...]:
+    return next((f.plugin_names for f in LEFT_CORE if f.platform == platform), ())
 
 
 def platform_configured_on(home: Path, name: str) -> bool:
@@ -237,19 +245,6 @@ def _core_platforms_except(platform: str, *others: str) -> tuple[str, ...]:
 # Core put the yb_* tools in ``hermes-yuanbao`` only (toolsets.py before Yuanbao left core), so no other
 # platform's default composite carried them. A third-party plugin platform core never knew stays uncovered.
 _YUANBAO_OFF_PLATFORMS = _core_platforms_except("yuanbao", "homeassistant", "qqbot")
-
-_YUANBAO_NOTICE = ("Yuanbao is now a Hermes Labs plugin: built by Nous Research, not supported, and likely not "
-                   "maintained going forward. Fixes from the community are welcome.")
-
-
-def _yuanbao_notice(home: Path, *, process_env: bool = False) -> str:
-    # Core's adapter ignored a bare ``yuanbao`` there; the catalog plugin does not. The install's enable
-    # purges the entry from the user's list, so this fires only when it survived (a managed overlay pin).
-    if plugin_present("yuanbao", home) and _plugins_listed(home, ("yuanbao",))[1]:
-        return (f"{_YUANBAO_NOTICE} plugins.disabled lists 'yuanbao', which now turns Yuanbao off; "
-                "remove it to keep using Yuanbao.")
-    return _YUANBAO_NOTICE
-
 
 def _labs_notice(plugin: str, label: str) -> Callable[..., str]:
     """A Labs plugin's migration notice, plus the sentence for a bare *plugin* left in ``plugins.disabled``
@@ -758,7 +753,7 @@ LEFT_CORE: tuple[LeftCoreFeature, ...] = (
                      "YUANBAO_HOME_CHANNEL_NAME"),
         toolsets=("yuanbao",), off_platforms=_YUANBAO_OFF_PLATFORMS,
         legacy_toolsets=("hermes-yuanbao", "hermes-gateway"),
-        platform="yuanbao", enable_env=("YUANBAO_APP_ID", "YUANBAO_APP_SECRET"), notice=_yuanbao_notice,
+        platform="yuanbao", enable_env=("YUANBAO_APP_ID", "YUANBAO_APP_SECRET"), notice=_labs_notice("yuanbao", "Yuanbao"),
     ),
     LeftCoreFeature(
         # QQ_STT_API_KEY stays on local_env_policy's own short list, as core had it. QQ_* channel ownership
@@ -911,6 +906,12 @@ def legacy_plugin_alias(name: str) -> str:
     """The catalog plugin a bundled key that left core now names (``observability/langfuse`` ->
     ``langfuse``), else ``""``."""
     return next((f.plugin for f in LEFT_CORE if f.plugin_key and name in (f.plugin_key, *f.plugin_names)), "")
+
+
+def legacy_platform_alias(name: str) -> str:
+    """The platform a left-core row's old bundled manifest name configured (``platforms.qqbot-platform``
+    read as ``platforms.qqbot``, as core's bundled-alias scan did), else ``""``."""
+    return next((f.platform for f in LEFT_CORE if f.platform and name in f.plugin_names), "")
 
 
 def legacy_plugin_keys(plugin: str) -> set[str]:
