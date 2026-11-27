@@ -275,3 +275,20 @@ def test_a_retry_that_removed_our_leftover_and_then_failed_stays_owed(tmp_path, 
     assert default_plugins.install_defaults(home, entries=entries)["owed"] == ["accent-picker"]
     assert attempts == ["accent-picker"] * 3, "a tree we removed was read as the user's removal"
 
+
+
+@pytest.mark.parametrize(("plugin", "disabled"), [
+    ("accent-picker", "accent-picker"),
+    ("yuanbao", "yuanbao"), ("yuanbao", "platforms/yuanbao"), ("yuanbao", "yuanbao-platform"),  # core's spellings
+])
+def test_a_default_the_home_disabled_under_any_of_its_names_is_not_installed(tmp_path, installs, plugin, disabled):
+    """The install enables the plugin, which lifts the disable: a home that turned a default off (under its
+    catalog name or a bundled key it left core under) keeps it off; lifting the disable brings it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(f"plugins:\n  disabled: ['{disabled}']\n", encoding="utf-8")
+    entries = [_entry(plugin)]
+    assert default_plugins.install_defaults(home, entries=entries) == {"installed": [], "owed": []}
+    assert installs == [] and plugin not in default_plugins._recorded(home)
+    (home / "config.yaml").write_text("plugins:\n  disabled: []\n", encoding="utf-8")
+    assert default_plugins.install_defaults(home, entries=entries)["installed"] == [plugin]

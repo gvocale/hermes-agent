@@ -111,6 +111,14 @@ def _settled(home: Path, entry) -> bool:
     return enabled or disabled
 
 
+def _user_disabled(home: Path, entry) -> bool:
+    """*home*'s ``plugins.disabled`` names *entry* under any name it has had: the catalog name or a bundled
+    key it left core under (``platforms/weixin``, core's manifest name). The install would enable it and
+    lift that disable, so a home that turned the plugin off never gets it automatically."""
+    from hermes_cli.left_core_migration import _plugins_listed, legacy_plugin_keys
+    return _plugins_listed(home, (entry.name, *sorted(legacy_plugin_keys(entry.name))))[1]
+
+
 def _attempt(entry) -> str:
     """Failure-stamp name of this home's automatic install of *entry*."""
     return f"default-{entry.name}"
@@ -161,6 +169,9 @@ def install_defaults(home: Path, *, say: Callable[[str], None] = logger.info,
     install = _install_into(home, consent=True)  # a reviewed default: its dependencies come with it
     for entry in pending:
         if entry.name in have:
+            continue
+        if _user_disabled(home, entry):  # not recorded: lifting the disable lets a later pass install it
+            logger.debug("default plugin %s: disabled in %s's plugins.disabled, not installed", entry.name, home)
             continue
         try:
             # A tree still on disk here is one an earlier automatic attempt left and nobody chose since
