@@ -457,10 +457,10 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
         return False
 
 
-def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
+async def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
     """Hydrate a scoped run status and fail stale owners closed."""
-    from gateway.platforms.api_server_authority_runs import run_projection
-    canonical = run_projection(self, run_id)
+    from gateway.platforms.api_server_authority_runs import read_run_projection
+    canonical = await read_run_projection(self, run_id)
     if canonical is not None:
         # The documented poll shape: the canonical projection decides status/output/usage; the
         # retained run record still names the object, the requested model and the served runtime.
@@ -470,12 +470,26 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
     status = self._run_statuses.get(run_id)
     if status is not None:
         if run_id in self._run_idempotency_ids:
-            scope = self._run_idempotency_scope(request)
-            self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
-        return status
+            await asyncio.to_thread(
+                self._run_idempotency_store.extend_retention, self._run_idempotency_scope(request),
+                run_id, _room_retention_until(request))
+        return self._run_statuses.get(run_id, status)
     scope = self._run_idempotency_scope(request)
-    record = self._run_idempotency_store.status_for_run(
-        scope, run_id, retention_until=_room_retention_until(request))
+    status = await asyncio.to_thread(
+        _recover_run_status, self._run_idempotency_store, scope, run_id, _room_retention_until(request))
+    # Other requests or the runner can publish a newer in-memory status while storage is pending.
+    current = self._run_statuses.get(run_id)
+    if current is not None:
+        return current
+    if status is not None:
+        self._run_statuses[run_id] = status
+        self._run_idempotency_ids.add(run_id)
+        self._run_owners[run_id] = scope
+    return status
+
+
+def _recover_run_status(store, scope, run_id, retention_until):
+    record = store.status_for_run(scope, run_id, retention_until=retention_until)
     if record is None:
         return None
     status = dict(record["status"])
@@ -484,10 +498,7 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
-    self._run_statuses[run_id] = status
-    self._run_idempotency_ids.add(run_id)
-    self._run_owners[run_id] = scope
+        store.update_status(run_id, status)
     return status
 
 
@@ -556,14 +567,14 @@ def _accepted_response(run_id: str, status: str, gateway_session_key, *, replaye
         {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
 
 
-def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
+async def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
     """409 for a fingerprint conflict, else a 202 replay of the already-admitted run."""
     if outcome == "conflict":
         return _json_error(
             _openai_error, "Idempotency-Key was already used with a different request payload",
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
-    status = self._durable_run_status(request, original_id) or record["status"]
+    status = await self._durable_run_status(request, original_id) or record["status"]
     return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
 
 
@@ -819,7 +830,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             idempotency_scope, idempotency_key, idempotency_fingerprint,
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+            return await _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
@@ -864,7 +875,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
                 self._run_statuses, self._run_owners)
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+            return await _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
@@ -1209,7 +1220,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         self._run_owners.pop(run_id, None)
 
 
-def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
+async def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
@@ -1219,13 +1230,16 @@ def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    if self._run_idempotency_store.owns_run(scope, run_id):
-        return True
-    from gateway.session_api_turn import owns_api_run
-    return owns_api_run(self, run_id, scope)
+    def owns_stored_run():
+        from gateway.session_api_turn import owns_api_run
+        return self._run_idempotency_store.owns_run(scope, run_id) or owns_api_run(self, run_id, scope)
+
+    owns_stored = await asyncio.to_thread(owns_stored_run)
+    owner = self._run_owners.get(run_id)
+    return owner == scope if owner is not None else owns_stored
 
 
-def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
+async def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
     """Authenticate (*permission* -> room-grant aware; ``None`` -> API key only) and resolve
     ``(run_id, status, agent, task, error)``; *active_fallback* reports a live in-process run
     without pollable status as ``running`` instead of 404."""
@@ -1234,11 +1248,11 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         return None, None, None, None, auth_err
     _openai_error = _api_server._openai_error
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await self._request_owns_run(request, run_id):
         return run_id, None, None, None, _run_not_found(_openai_error, run_id)
+    status = await self._durable_run_status(request, run_id)
     agent = self._active_run_agents.get(run_id)
     task = self._active_run_tasks.get(run_id)
-    status = self._durable_run_status(request, run_id)
     if status is None and active_fallback and (agent is not None or task is not None):
         status = self._set_run_status(run_id, "running")
     if status is None:
@@ -1248,7 +1262,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Response:
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = _load_owned_run(
+    _, status, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err or web.json_response(status)
 
@@ -1260,7 +1274,7 @@ async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await self._request_owns_run(request, run_id):
         return _run_not_found(_api_server._openai_error, run_id)
     # Allow subscribing slightly before the run is registered (race window).
     # Confirm the force-kill actually reaped the process before we clear its PID file / scoped locks.
@@ -1358,7 +1372,7 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -1422,7 +1436,7 @@ async def _respond_authority_run(self, run_id, body, *, kind, _api_server):
 
 
 async def _handle_run_clarify(self, request, *, _api_server):
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -1440,7 +1454,7 @@ def _steer_refused(_openai_error, run_id):
 async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, _, err = _load_owned_run(
+    run_id, status, agent, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
@@ -1508,7 +1522,7 @@ def _person_steer_joined(owned):
 async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, task, err = _load_owned_run(
+    run_id, status, agent, task, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
@@ -1542,7 +1556,7 @@ async def _handle_resolve_unknown_run(
     self, request: web.Request, *, _api_server
 ) -> web.Response:
     """POST /v1/runs/{run_id}/resolve-unknown — acknowledge one lost owner epoch."""
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=False)
     if err is not None:
         return err

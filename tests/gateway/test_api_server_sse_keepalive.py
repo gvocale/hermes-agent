@@ -73,7 +73,10 @@ async def test_idle_run_events_stream_uses_shared_keepalive_cadence(monkeypatch,
     stream = _RunStream()
     adapter._run_streams["run_idle"] = stream
     adapter._set_run_status("run_idle", "running")
-    monkeypatch.setattr(adapter, "_request_owns_run", lambda request, run_id: True)
+    async def owns_run(request, run_id):
+        return True
+
+    monkeypatch.setattr(adapter, "_request_owns_run", owns_run)
 
     app = web.Application()
     app["api_server_adapter"] = adapter

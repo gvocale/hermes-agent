@@ -1,4 +1,5 @@
 """API run controls resolve durable claims, never adapter agent/task ownership."""
+import asyncio
 from dataclasses import asdict
 
 from gateway.session_contract import SessionActor, SessionRef
@@ -38,7 +39,6 @@ async def continued_session(adapter, session_id, request_id=None):
     """``continued_api_session`` for an HTTP door, before its response starts -> ``(session_id,
     None)`` or ``(session_id, error response)``: a busy or unreadable store is the retryable 503
     ``storage_unavailable`` (``store_error_response``), as for the header-less chat lookup."""
-    import asyncio
     import sqlite3
     from gateway.platforms.api_server import _openai_error
     from gateway.session_api import continued_api_session
@@ -64,16 +64,31 @@ def run_admission(adapter, run_id):
     return (authority, asdict(rows[0])) if rows else None
 
 
-def run_projection(adapter, run_id):
+def _read_run_projection(adapter, run_id):
     owned = run_admission(adapter, run_id)
     if owned is None:
         return None
     authority, row = owned
+    from gateway.platforms.api_server_store import authority_store
+    return authority, row, admission_result(authority_store(authority), row['admission_id'])
+
+
+async def read_run_projection(adapter, run_id):
+    """Read the durable record off-loop, then project live controls on the owner loop."""
+    return _project_run(run_id, await asyncio.to_thread(_read_run_projection, adapter, run_id))
+
+
+def run_projection(adapter, run_id):
+    return _project_run(run_id, _read_run_projection(adapter, run_id))
+
+
+def _project_run(run_id, projection):
+    if projection is None:
+        return None
+    authority, row, saved = projection
     # ``unknown`` is not terminal: later turns wait for POST /v1/runs/{id}/resolve-unknown, and
     # ``interrupted`` is in TERMINAL_STATUSES, so a poller would stop at a paused head.
     status = {'queued': 'queued', 'started': 'running', 'unknown': 'unknown', 'terminal': row['outcome']}.get(row['status'])
-    from gateway.platforms.api_server_store import authority_store
-    saved = admission_result(authority_store(authority), row['admission_id'])
     result = saved.get('result', {}) if saved else {}
     if row['status'] == 'terminal':
         if result.get('interrupted') or row['outcome'] == 'interrupted':
