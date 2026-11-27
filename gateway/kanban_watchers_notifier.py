@@ -649,7 +649,7 @@ class _KanbanNotification:
 
     async def wake(self) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
-        from gateway.wake import deliver_wake
+        from gateway.wake import deliver_wake, wake_origin
         sub = self.sub
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
@@ -659,7 +659,8 @@ class _KanbanNotification:
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
-                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
+                                   notification_category="diagnostic" if self.wake_diagnostic else "result",
+                                   origin=wake_origin("kanban_wake", task_id=self.task_id, board=self.board_slug))
             self._log_woke()
             return
         from gateway.session import SessionSource

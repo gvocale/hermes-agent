@@ -742,6 +742,22 @@ curl -N -X POST http://localhost:8642/api/sessions/$ID/chat/stream \
   -d '{"input": "what files changed in the last hour?"}'
 ```
 
+### Telling wakes from user input
+
+Hermes can start a turn on an API session itself: a Kanban task-status wake or a background-process
+notification wakes the session through the same chat path a client uses. `GET /api/sessions/{id}/messages`
+returns each row's `display_kind` and `display_metadata`, so a client can tell the two apart without
+reading the text:
+
+- A turn a client sent has `display_kind: null`, even when its text is identical to a wake's.
+- A wake's `role: "user"` row has `display_kind: "internal_notification"` and
+  `display_metadata.origin` naming the producer: `"kanban_wake"` (with `task_id` and `board`) or
+  `"process_notification"` (with `process_session_id` and `event`, for example `"completion"` or
+  `"watch_match"`).
+
+The marker is display-only: the model receives the same text either way. Clients cannot set it; it
+comes only from the gateway's own wake path.
+
 ## Skills and toolsets discovery
 
 `GET /v1/skills` and `GET /v1/toolsets` let external clients enumerate the agent's capabilities deterministically over REST instead of asking the model. Both are read-only and gated by `API_SERVER_KEY`.

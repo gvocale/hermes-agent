@@ -344,7 +344,7 @@ async def execute_admission(authority, ref, row):
         from gateway.session_ingress_context import restore_provenance
         home = restore_provenance(authority.runner, event.source, provenance)
     from gateway.config import Platform
-    from gateway.session_api_turn import api_execution, prepare_api_execution
+    from gateway.session_api_turn import api_execution, api_turn_display, prepare_api_execution
     from gateway.session_results import execution_result
     is_api = live.source.platform == Platform.API_SERVER
     if not (event.internal or is_api or live.source.platform == Platform.LOCAL):
@@ -374,6 +374,8 @@ async def execute_admission(authority, ref, row):
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
+                # ...and says nothing about who wrote the turn: its row is typed from the admission.
+                event._api_turn_display = api_turn_display(prepared)
             response = await authority.runner._handle_message(event)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:

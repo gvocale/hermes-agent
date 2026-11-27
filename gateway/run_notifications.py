@@ -780,7 +780,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
         """
-        from gateway.wake import deliver_wake, persist_delegation_delivery
+        from gateway.wake import deliver_wake, persist_delegation_delivery, wake_origin
         scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
@@ -801,8 +801,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 from gateway.run import _async_profile_runtime_scope
                 source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
                 scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
+            origin = wake_origin(_process_event_turn_origin(evt), process_session_id=evt.get("session_id"),
+                                 event=evt.get("type"))
             deliver = lambda: deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
-                notification_category="diagnostic" if diagnostic_process_event(evt) else "result")
+                notification_category="diagnostic" if diagnostic_process_event(evt) else "result", origin=origin)
         try:
             logger.info(info, raw_sid)
             async with scope:

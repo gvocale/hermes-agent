@@ -308,10 +308,26 @@ def display_kind_for_event(event: Any) -> str | None:
     if kind := admission_display(event).get("kind"):
         # A canonical admission committed hidden (Desktop widget intent): never a user bubble.
         return kind
+    api_display = _api_turn_display(event)
+    if api_display is not None:
+        # An admitted API turn runs ``internal`` for trust only: its kind is what the admission
+        # recorded (a wake's runtime notice), else none: the client's own input (#152765).
+        return api_display.get("kind")
     if getattr(event, "internal", False) and _producer_card(event):
         return event.metadata["display_kind"]
     if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
         return INTERNAL_NOTIFICATION_DISPLAY_KIND
+    return None
+
+
+def _api_turn_display(event: Any) -> dict | None:
+    """The display ``session_ingress`` recorded for an admitted API turn (``{}`` for client input), on
+    this event or the one a plugin rewrote into it; ``None`` for any other turn."""
+    while event is not None:
+        display = getattr(event, "_api_turn_display", None)
+        if display is not None:
+            return display
+        event = getattr(event, "_rewritten_from", None)
     return None
 
 
@@ -326,10 +342,12 @@ def _producer_card(event: Any) -> dict:
 
 def display_metadata_for_event(event: Any) -> dict:
     """``{"display_text": ...}`` for an internal event whose producer named an async-result card, plus the
-    ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
+    ``title_preview`` (titler-only) a canonical admission committed for this exact event, plus an
+    admitted API wake's ``origin`` and ids."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
+    api_metadata = (_api_turn_display(event) or {}).get("metadata") or {}
+    return {**_producer_card(event), **({"title_preview": preview} if preview else {}), **api_metadata}
 
 
 def persisted_user_metadata_for_event(event: Any) -> dict:

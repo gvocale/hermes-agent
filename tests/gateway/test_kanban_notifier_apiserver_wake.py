@@ -113,8 +113,8 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, origin=None):
+        posts.append({"text": text, "session_id": session_id, "origin": origin})
 
     import gateway.wake as wake_mod
 
@@ -138,6 +138,8 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert "done once" in wake_text, "creator wake must carry the worker handoff"
     assert "not a request to decompose" in wake_text.lower()
     assert "do not recreate" in wake_text.lower()
+    # The wake path (never the request) names the producer, so the row is typed (#152765).
+    assert posts[0]["origin"] == {"origin": "kanban_wake", "task_id": tid, "board": "default"}
     # The wake self-post IS the delivery on this path (no separate text-ping
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
@@ -170,7 +172,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, origin=None):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -195,7 +197,7 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(adapter, *, text, session_id, origin=None):
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")

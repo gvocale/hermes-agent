@@ -680,8 +680,8 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, origin=None):
+        posts.append({"text": text, "session_id": session_id, "origin": origin})
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -700,6 +700,8 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     assert posts[0]["session_id"] == "raw-hq-session-id"
     assert posts[0]["text"].startswith("[SYSTEM: subagent finished]")
     assert posts[0]["text"].rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
+    # The wake path names the producer for the stored row; the model text above is unchanged (#152765).
+    assert posts[0]["origin"] == {"origin": "process_notification", "process_session_id": "proc_watch"}
 
 
 @pytest.mark.asyncio
@@ -716,7 +718,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, origin=None):
         posts.append(session_id)
 
     import gateway.wake as wake_mod
@@ -752,7 +754,7 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, origin=None):
         posts.append(session_id)
 
     persisted = []

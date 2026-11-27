@@ -640,8 +640,19 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
         return session_id
 
 
+def wake_row_kwargs(wake_origin) -> dict:
+    """``run_conversation`` kwargs typing a wake turn's user row as a runtime notice whose
+    ``display_metadata`` names the producer (``gateway.wake.wake_origin``); ``{}`` for any other turn."""
+    if not wake_origin:
+        return {}
+    from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+    return {"persist_user_display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND,
+            "persist_user_display_metadata": dict(wake_origin)}
+
+
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                notification_category: str = "result", _api_server) -> None:
+                                notification_category: str = "result", origin: Optional[dict] = None,
+                                _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).
 
     The HTTP wake self-post cannot serve a multiplexed *served* profile: ``/p/<profile>/`` on
@@ -653,7 +664,8 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
     the session — never derived here, so a missing proof cannot silently become the default.
     Raises on failure so the caller can rewind its cursor: a draining gateway fails at once
     (the HTTP self-post's 503) while a saturated concurrent-run cap is retried with the same
-    backoff the HTTP self-post uses for a 429.
+    backoff the HTTP self-post uses for a 429. ``origin`` (``gateway.wake.wake_origin``) types the
+    wake's user row as a runtime notice.
     """
     from gateway.wake import _RETRY_DELAYS_SECONDS
     profile = (profile or "").strip()
@@ -695,7 +707,7 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
                 user_message=text, conversation_history=history, session_id=resolved,
                 gateway_session_key=None, **overrides, route=route, requested_runtime={},
                 route_source="global", session_history_delivery="1",
-                notification_category=notification_category,
+                notification_category=notification_category, wake_origin=origin,
             )
             return
         raise RuntimeError(

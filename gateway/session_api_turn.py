@@ -13,6 +13,7 @@ from gateway.session_api import bind_api_steps, restore_api_session, run_steps, 
 from gateway.session_authority import admission_row
 from gateway.session_persistence import authority_persistence
 from gateway.session_results import admission_result
+from gateway.wake import valid_wake_origin
 from persistence.core.canonical import canonical_json
 from persistence.core.errors import AuthorityRefusal
 
@@ -58,8 +59,9 @@ def check_api_turn(authority, ref, payload):
         # 'browser_control' is accepted and ignored: admissions persisted while the removed
         # browser-extension control existed may carry it and must still recover.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'wake_origin'}
                 or data.get('resume_unanswered', True) is not True
+                or ('wake_origin' in data and not valid_wake_origin(data['wake_origin']))
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
@@ -189,6 +191,12 @@ def admit_api_steps(adapter, **kwargs):
         # The session-chat door's one policy-gated re-run (#115325): its failed attempt left this text as
         # the transcript's unanswered tail, which the turn adopts instead of appending it again.
         payload['api_turn_v1']['resume_unanswered'] = True
+    if kwargs.get('wake_origin'):
+        # Set only by the wake path (gateway.wake), never by client JSON: the turn's user row is
+        # typed as a runtime notice. Committed with the admission, so a recovered turn keeps it.
+        if not valid_wake_origin(kwargs['wake_origin']):
+            raise AuthorityRefusal('invalid_params')
+        payload['api_turn_v1']['wake_origin'] = dict(kwargs['wake_origin'])
     if kwargs.get('relay_metadata'):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
@@ -426,7 +434,19 @@ def prepare_api_execution(authority, ref, payload):
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
-            'resume_unanswered': bool(data and data.get('resume_unanswered'))}
+            'resume_unanswered': bool(data and data.get('resume_unanswered')),
+            'wake_origin': data.get('wake_origin') if data else None}
+
+
+def api_turn_display(prepared):
+    """The persisted user-row display of an admitted API turn. The drain runs every API turn
+    ``internal`` for trust, which alone says nothing about who wrote it: a wake path's origin types
+    the row as a runtime notice, any other turn is the client's own input (``{}``, no kind)."""
+    origin = prepared.get('wake_origin')
+    if not origin:
+        return {}
+    from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+    return {'kind': INTERNAL_NOTIFICATION_DISPLAY_KIND, 'metadata': dict(origin)}
 
 
 def _api_observers(authority, session_id):

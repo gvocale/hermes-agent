@@ -2481,7 +2481,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
-            "display_kind")
+            "display_kind", "display_metadata")
         return {key: message.get(key) for key in safe_keys if key in message}
 
     async def _read_json_body(self, request: web.Request) -> tuple[dict[str, Any], Optional[web.Response]]:
@@ -2513,12 +2513,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return []
 
     async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
-                                        notification_category: str = "result") -> None:
+                                        notification_category: str = "result", origin: Optional[dict] = None) -> None:
         """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key);
         see ``api_server_runs.run_internal_session_turn``."""
         await _api_runs.run_internal_session_turn(
             self, session_id=session_id, text=text, profile=profile,
-            notification_category=notification_category, _api_server=sys.modules[__name__])
+            notification_category=notification_category, origin=origin, _api_server=sys.modules[__name__])
 
     @_require_auth
     async def _handle_list_sessions(self, request: web.Request) -> web.Response:
@@ -3636,7 +3636,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
-        approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
+        approval_session_key: Optional[str] = None, walked_from: Optional[str] = None, wake_origin=None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
@@ -3650,7 +3650,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``resume_unanswered_turn`` marks a policy-gated re-run of a turn whose user row the failed attempt
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
-        (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        (``agent.session_persistence.adopt_unanswered_turn``; #115325). ``wake_origin``: see ``gateway.wake``."""
         if getattr(self.gateway_runner, "session_authority", None) is not None:
             from gateway.session_api_turn import run_api_turn
             return await run_api_turn(self, user_message=user_message, conversation_history=conversation_history,
@@ -3658,7 +3658,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                 interim_assistant_callback=interim_assistant_callback, reasoning_callback=reasoning_callback,
-                status_callback=status_callback, walked_from=walked_from,
+                status_callback=status_callback, walked_from=walked_from, wake_origin=wake_origin,
                 agent_ref=agent_ref, active_run_id=active_run_id, gateway_session_key=gateway_session_key,
                 requested_model=requested_model, requested_provider=requested_provider, model_options=model_options,
                 route=route, session_model=session_model, requested_runtime=requested_runtime,
@@ -3724,7 +3724,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
-                        **author_kwargs,
+                        **author_kwargs, **_api_runs.wake_row_kwargs(wake_origin),
                     )
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata

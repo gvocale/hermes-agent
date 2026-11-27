@@ -961,6 +961,10 @@ class OpenAICompatRoutesMixin:
         # above still applies; it grants no internal ingress or control authority.
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
             run_kwargs["notification_category"] = "diagnostic"
+        # Only this process's own wake self-post holds a token that resolves: a client header or
+        # body cannot type its turn as a runtime notice (#152765).
+        from gateway.wake import self_post_turn_kwargs
+        run_kwargs.update(self_post_turn_kwargs(request.headers, provided_session_id))
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
             # tool_call_ids with an emitted "running": a "completed" without one (internal/

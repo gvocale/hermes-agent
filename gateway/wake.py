@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,39 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 _RECEIPT_CHARS = 200
+
+# A stateless (api_server) wake turn's user row is typed as a runtime notice with
+# ``display_metadata.origin`` naming the producer (``wake_origin``), so a client reading
+# ``GET /api/sessions/{id}/messages`` can tell it from a person typing the same text (#152765).
+# The origin is never read from a request body: the in-process route passes it as an argument
+# and the HTTP self-post sends a one-time token only this process can resolve.
+WAKE_TOKEN_HEADER = "X-Hermes-Wake-Token"
+_ORIGIN_VALUE_CHARS = 200
+_pending_wake_origins: dict[str, tuple[str, dict]] = {}
+
+
+def wake_origin(origin: str, **ids: Any) -> dict:
+    """``{"origin": origin, **ids}`` for a wake's user row; blank ids are dropped and every value
+    is a short string, so the row carries identifiers, not payloads."""
+    return {"origin": str(origin), **{key: str(value)[:_ORIGIN_VALUE_CHARS]
+                                      for key, value in ids.items() if value not in (None, "")}}
+
+
+def valid_wake_origin(value: Any) -> bool:
+    """Whether *value* is the shape ``wake_origin`` builds (a committed admission re-checks it)."""
+    return (isinstance(value, dict) and isinstance(value.get("origin"), str) and bool(value["origin"])
+            and all(isinstance(k, str) and isinstance(v, str) and len(v) <= _ORIGIN_VALUE_CHARS
+                    for k, v in value.items()))
+
+
+def self_post_turn_kwargs(headers: Any, session_id: str) -> dict:
+    """``{"wake_origin": ...}`` when *headers* carry the token a pending wake self-post registered
+    for this exact *session_id* (the raw ``X-Hermes-Session-Id``), else ``{}``: a missing, unknown
+    or foreign-session token types nothing."""
+    entry = _pending_wake_origins.get(str(headers.get(WAKE_TOKEN_HEADER) or ""))
+    if entry is None or not session_id or entry[0] != session_id:
+        return {}
+    return {"wake_origin": dict(entry[1])}
 
 
 def adapter_supports_push(adapter: Any) -> bool:
@@ -133,7 +167,7 @@ def _local_receipt(source: Any, display_text: str) -> dict:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       display_text: str = "") -> None:
+                       display_text: str = "", origin: Optional[dict] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -141,6 +175,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
     ``display_text`` (collapsed to one line of at most 200 characters; blank means none) becomes the
     card on a LOCAL source's authority-admitted wake, which an idle classic CLI needs to open the turn.
+    ``origin`` (``wake_origin(...)``) types a non-push wake's user row as a runtime notice; push
+    adapters already persist their internal event's row as one.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
@@ -169,6 +205,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
+    if origin:
+        extra["origin"] = origin
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -240,11 +278,13 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None,
+                                      origin: Optional[dict] = None) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
-    nobody watches.
+    nobody watches. ``origin`` rides a one-time ``WAKE_TOKEN_HEADER`` token registered for this
+    session only while the post is in flight (``self_post_turn_kwargs``).
 
     ``profile`` (a served secondary under ``gateway.multiplex_profiles``) takes the IN-PROCESS
     route instead of the HTTP one: the shared listener's ``/p/<profile>/`` mirror authenticates
@@ -260,8 +300,21 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                 f"wake self-post for served profile {profile!r} requires in-process session "
                 "delivery; refusing to self-post as the default profile")
         await in_process(session_id=session_id, text=text, profile=str(profile),
-                         notification_category=notification_category)
+                         notification_category=notification_category,
+                         **({"origin": origin} if origin else {}))
         return
+    token = secrets.token_urlsafe(32) if origin else ""
+    if token:
+        _pending_wake_origins[token] = (session_id, dict(origin or {}))
+    try:
+        await _post_wake_turn(adapter, text=text, session_id=session_id,
+                              notification_category=notification_category, token=token)
+    finally:
+        _pending_wake_origins.pop(token, None)
+
+
+async def _post_wake_turn(adapter: Any, *, text: str, session_id: str, notification_category: str,
+                          token: str) -> None:
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
@@ -276,6 +329,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
         host = f"[{host}]"  # bare IPv6 literal
     url = f"http://{host}:{port}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
+    if token:
+        headers[WAKE_TOKEN_HEADER] = token
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
                "messages": [{"role": "user", "content": text}], "stream": False}
     if notification_category == "diagnostic":

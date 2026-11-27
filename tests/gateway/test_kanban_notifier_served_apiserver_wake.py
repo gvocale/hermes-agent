@@ -45,10 +45,12 @@ class RecordingApiServerAdapter:
         self.homes = []
         self.profiles = []
 
-    async def run_internal_session_turn(self, *, session_id, text, profile, notification_category="result"):
+    async def run_internal_session_turn(self, *, session_id, text, profile, notification_category="result",
+                                        origin=None):
         self.homes.append(str(get_hermes_home()))
         self.profiles.append(profile)
-        self.turns.append({"session_id": session_id, "text": text, "category": notification_category})
+        self.turns.append({"session_id": session_id, "text": text, "category": notification_category,
+                           "origin": origin})
 
     async def send(self, chat_id, text, metadata=None):
         from gateway.platforms.base import SendResult
@@ -184,6 +186,7 @@ def test_served_profile_wake_runs_in_process_only_for_the_session_it_owns(served
 
     assert [turn["session_id"] for turn in adapter.turns] == [SESSION]  # the origin, not the worker
     assert task in adapter.turns[0]["text"] and "done once" in adapter.turns[0]["text"]
+    assert adapter.turns[0]["origin"] == {"origin": "kanban_wake", "task_id": task, "board": "default"}
     # Under the OWNING profile's scope, told which profile the authorization proved.
     assert adapter.homes == [str(served.builder)]
     assert adapter.profiles == ["builder"]
@@ -261,6 +264,7 @@ def test_internal_session_turn_targets_the_live_session_under_the_owner_profile(
     assert seen["user_message"] == "wake"
     assert seen["session_history_delivery"] == "1"
     assert seen["route"] == aliased_route  # resolved like the HTTP wake path, not route=None
+    assert seen["wake_origin"] is None  # no origin given: the row is not typed
     assert seen["home"] == str(served.builder)
     assert seen["request_profile"] == "builder"
     assert _api_request_profile.get() is None  # binding restored, never leaked
