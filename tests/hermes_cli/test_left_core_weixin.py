@@ -178,3 +178,21 @@ def test_a_weixin_the_default_installer_placed_and_the_user_removed_stays_remove
     assert calls == [] and said == []
     (home / "config.yaml").write_text("_left_core_installed: [weixin]\n", encoding="utf-8")
     assert "weixin" in default_plugins._recorded(home)
+
+
+@pytest.mark.parametrize("name", ["platforms/weixin", "weixin-platform"])
+def test_a_core_era_disable_keeps_both_installers_away(tmp_path, monkeypatch, name):
+    """Core never ran Weixin for this home, so the migration skips it; the default installer, which runs
+    beside it on every update, must not install (and enable) it either."""
+    from hermes_cli import default_plugins
+    from hermes_cli.plugin_catalog import entry_from_mapping
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    home = _home(tmp_path, env=_CREDS, config=f"plugins:\n  disabled: ['{name}']\n")
+    install, calls = _install(home)
+    assert lcm.migrate_home(home, install=install, say=lambda _: None) == []
+    monkeypatch.setattr(lcm, "_install_into", lambda home, consent=None: lambda n, discard=None: install(n))
+    entry = entry_from_mapping({"name": "weixin", "repo": "https://github.com/NousResearch/hermes-official-plugins",
+                                "sha": "a" * 40, "description": "d", "maintainer": "NousResearch", "tier": "official",
+                                "default": True}, "weixin")
+    assert default_plugins.install_defaults(home, entries=[entry]) == {"installed": [], "owed": []}
+    assert calls == []
