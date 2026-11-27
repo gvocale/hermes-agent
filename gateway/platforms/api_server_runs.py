@@ -640,6 +640,245 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
         return session_id
 
 
+def _session_id_set(session_ids) -> frozenset:
+    """Non-empty string ids from *session_ids* (a single id or an iterable of ids)."""
+    if isinstance(session_ids, str):
+        session_ids = (session_ids,)
+    return frozenset(str(s) for s in session_ids if s)
+
+
+def session_is_idle(self, session_ids) -> bool:
+    """True only when nothing on this adapter can be running a turn for any of *session_ids*.
+
+    Every route that runs an agent is covered: ``/v1/chat/completions`` (streaming and not),
+    ``/v1/responses`` and the session-chat routes all go through ``_run_agent``, which keeps
+    ``_session_turns_in_flight``; ``/v1/runs`` keeps its own ``_run_statuses`` rows (any status that
+    is not terminal counts, including ``unknown``). A pending approval or clarify prompt on the
+    session, or a request admitted but not yet inside ``_run_agent``, also counts as busy.
+    Any doubt (a missing table, an unreadable status, a lookup error) answers False."""
+    try:
+        ids = _session_id_set(session_ids)
+        turns = getattr(self, "_session_turns_in_flight", None)
+        if not ids or not isinstance(turns, dict):
+            return False
+        if int(getattr(self, "_pending_agent_requests", 0) or 0) > 0:
+            return False
+        if any(turns.get(sid, 0) > 0 for sid in ids):
+            return False
+        for status in list(self._run_statuses.values()):
+            if status.get("session_id") in ids and status.get("status") not in TERMINAL_STATUSES:
+                return False
+        for run_id in list(self._run_approval_sessions):
+            if (self._run_statuses.get(run_id) or {}).get("session_id") in ids:
+                return False
+        from tools import clarify_gateway
+        from tools.approval import has_blocking_approval
+        return not any(has_blocking_approval(sid) or clarify_gateway.has_pending(sid) for sid in ids)
+    except Exception:
+        logger.warning("session_is_idle: could not prove the session idle; treating it as busy", exc_info=True)
+        return False
+
+
+def session_has_pending_prompt(self, session_ids) -> bool:
+    """True when a person is being asked something on any of *session_ids* (a dangerous-command approval
+    or a clarify question), or when that cannot be read. Nothing is handed to such a session: the answer
+    must come from the person, and a background result must never be mistaken for it."""
+    try:
+        ids = _session_id_set(session_ids)
+        from tools import clarify_gateway
+        from tools.approval import has_blocking_approval
+        # A streamed turn and a /v1/runs run key their approvals by run id, not by session id.
+        keys = set(ids) | {run_id for run_id in list(self._run_approval_sessions)
+                           if (self._run_statuses.get(run_id) or {}).get("session_id") in ids}
+        return any(has_blocking_approval(key) or clarify_gateway.has_pending(key) for key in keys)
+    except Exception:
+        logger.warning("session_has_pending_prompt: could not read the prompts; treating one as pending", exc_info=True)
+        return True
+
+
+def register_turn_agent(self, session_id, agent) -> bool:
+    """Record *agent* as running a turn for *session_id* (the target of ``hand_over_notice``). It
+    reopens the agent's notice buffer: an agent reused for a new turn accepts notices again."""
+    table = getattr(self, "_turn_agents", None)
+    if not session_id or not isinstance(table, dict):
+        return False
+    from agent.background_notices import reopen_turn
+    reopen_turn(agent)
+    table.setdefault(str(session_id), []).append(agent)
+    return True
+
+
+def unregister_turn_agent(self, session_id, agent) -> None:
+    """The turn is over: close the agent's notice buffer FIRST (a notice posted from now on is refused
+    and its owner keeps it), keep what the loop never read for ``deliver_late_notices``, then forget
+    the agent."""
+    from agent.background_notices import close_turn
+    sid = str(session_id)
+    unread = close_turn(agent)
+    if unread:
+        self._late_notices.setdefault(sid, []).extend(unread)
+    agents = self._turn_agents.get(sid, [])
+    if agent in agents:
+        agents.remove(agent)
+    if not agents:
+        self._turn_agents.pop(sid, None)
+
+
+def hand_over_notice(self, session_ids, notice) -> bool:
+    """Give *notice* to the agent running a turn on any of *session_ids* -> True when its buffer took
+    it (it will be read at a step boundary, or come back through ``deliver_late_notices``), False when
+    there is no such agent, its turn is closing, or a person is being asked something on the session."""
+    ids = _session_id_set(session_ids)
+    table = getattr(self, "_turn_agents", None)
+    if not ids or not isinstance(table, dict) or session_has_pending_prompt(self, ids):
+        return False
+    from agent.background_notices import post_notice
+    for sid in ids:
+        for agent in list(table.get(sid, ())):
+            if post_notice(agent, notice):
+                return True
+    return False
+
+
+def deliver_late_notices(self, session_id: str) -> None:
+    """After a turn on *session_id*: results it never read become ONE new turn (or delivery rows).
+    Runs on the event loop."""
+    entries = self._late_notices.pop(session_id, None) if isinstance(getattr(self, "_late_notices", None), dict) else None
+    if not entries:
+        return
+    task = asyncio.ensure_future(_deliver_late_notices(self, session_id, entries))
+    self._late_notice_tasks.add(task)
+    task.add_done_callback(self._late_notice_tasks.discard)
+
+
+async def _deliver_late_notices(self, session_id: str, entries) -> None:
+    """One new turn for the results, else a delivery row each. Every exit writes the row unless the
+    wake was accepted: an error, and a cancellation (shutdown) before the wake returned. A cancelled
+    wake whose request already went out may run anyway, so that one case can show a result twice,
+    never none."""
+    payloads = [n.payload for n in entries]
+    try:
+        deliver = getattr(getattr(self, "gateway_runner", None), "_deliver_late_delegation_results", None)
+        if deliver is None:
+            raise RuntimeError("no gateway runner to deliver a late result")
+        await deliver(self, session_id, payloads)
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            logger.warning("late delegation results for session %s: cancelled; saving delivery rows", session_id)
+        else:
+            # Never lose a result: whatever went wrong, the durable delivery row is the last resort.
+            logger.warning("late delegation results for session %s: delivery failed; saving delivery rows",
+                           session_id, exc_info=True)
+        await _save_late_rows(self, payloads)
+        if not isinstance(exc, Exception):
+            raise
+
+
+async def _save_late_rows(self, payloads) -> None:
+    from gateway.wake import persist_delegation_delivery
+    for payload in payloads:
+        with suppress(Exception):
+            await asyncio.shield(persist_delegation_delivery(
+                self, text=payload["text"], session_id=payload["raw_sid"], evt=payload["evt"]))
+
+
+class _TurnLease:
+    """The per-session turn count for a turn whose agent runs on an executor thread: taken before the
+    thread is submitted, released by the THREAD when it has really finished (the same rule as
+    ``_API_WORKER_LIVE``, #116535), never by the awaiting coroutine. A cancelled or abandoned request
+    (client disconnect, ``_abandon_agent_task``) leaves the thread running, so the session must stay
+    busy until then: no wake turn beside it, and a result handed to it still reaches the late-delivery
+    path once it ends."""
+
+    def __init__(self, adapter, loop, session_id) -> None:
+        self.adapter, self.loop = adapter, loop
+        self.session_id = str(session_id) if session_id else ""
+        self.ids = _session_id_set(session_id) if session_id else frozenset()
+        self._lock = threading.Lock()
+        self._state = "new"  # new -> running -> released | new -> cancelled (before the thread started)
+        if self.ids:
+            _mark_session_turn(adapter, self.ids, +1)
+
+    def wrap(self, fn):
+        def _counted():
+            with self._lock:
+                if self._state == "cancelled":
+                    raise asyncio.CancelledError()  # cancelled while queued: the count is already released
+                self._state = "running"
+            try:
+                return fn()
+            finally:
+                self._finish()
+        return _counted
+
+    def cancelled_before_start(self) -> None:
+        """The awaiting side was cancelled: release now only if the thread never started."""
+        with self._lock:
+            if self._state != "new":
+                return
+            self._state = "cancelled"
+        self._release()
+
+    def submit_failed(self) -> None:
+        with self._lock:
+            if self._state != "new":
+                return
+            self._state = "released"
+        self._release()
+
+    def _finish(self) -> None:
+        with self._lock:
+            self._state = "released"
+        try:
+            self.loop.call_soon_threadsafe(self._release)
+        except RuntimeError:
+            # The loop is already gone (shutdown): nothing can be scheduled. Drop the count and write the
+            # rows of whatever this turn left unread from this thread, on a private loop.
+            self._release(on_loop=False)
+
+    def _release(self, on_loop: bool = True) -> None:
+        if self.ids:
+            _mark_session_turn(self.adapter, self.ids, -1)
+        if not self.session_id:
+            return
+        if on_loop:
+            deliver_late_notices(self.adapter, self.session_id)
+            return
+        entries = self.adapter._late_notices.pop(self.session_id, None)
+        if entries:
+            with suppress(Exception):
+                asyncio.run(_save_late_rows(self.adapter, [n.payload for n in entries]))
+
+
+def reserve_idle_session(self, session_ids):
+    """Atomically check that *session_ids* are idle and mark them busy -> a release callable, or
+    ``None`` when the session is not provably idle. Check and mark happen in one synchronous block,
+    so two completions for one session cannot both pass the check. The caller releases once the
+    wake turn it is about to start has ended (the turn then holds its own mark inside ``_run_agent``)."""
+    if not session_is_idle(self, session_ids):
+        return None
+    ids = _session_id_set(session_ids)
+    _mark_session_turn(self, ids, +1)
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _mark_session_turn(self, ids, -1)
+    return release
+
+
+def _mark_session_turn(self, ids, delta: int) -> None:
+    turns = self._session_turns_in_flight
+    for sid in ids:
+        count = turns.get(sid, 0) + delta
+        if count > 0:
+            turns[sid] = count
+        else:
+            turns.pop(sid, None)
+
+
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
                                 notification_category: str = "result", _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).

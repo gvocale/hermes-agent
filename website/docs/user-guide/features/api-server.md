@@ -586,10 +586,83 @@ client turn owns the session lease and follows compression continuations.
 Chat Completions echoes the explicit session ID you supplied in both JSON and
 streaming responses; keep sending that ID even after compression.
 
-A completion **never starts an unsolicited model turn** or bypasses a pending
-human confirmation. The client owns the next turn. Clients that continue using
-their own history snapshots should use synchronous delegation rather than
+By default a completion **never starts an unsolicited model turn** or bypasses a
+pending human confirmation. The client owns the next turn. Clients that continue
+using their own history snapshots should use synchronous delegation rather than
 expecting a server-side delivery row to be merged into those snapshots.
+
+#### Continuing the conversation when a delegation finishes (opt-in)
+
+A single-user client that has no way to notice a saved delivery row (a browser
+chat, for example) can ask Hermes to continue the conversation itself:
+
+```yaml
+gateway:
+  delegation_completion_wake: true   # default: false
+```
+
+With the setting on, a finished delegation is handled in exactly one of three
+ways. Each is built so that the result is not delivered twice and not dropped;
+the limits of that (a stopped gateway, a wake whose answer never came back) are
+listed below.
+
+1. **The session is idle:** Hermes starts a normal turn on it, as it does for a
+   finished background process, and the model answers without a new user
+   message.
+2. **A turn is running:** the result is handed to that turn at its next step
+   boundary (after the current tool calls, before the next model request) as a
+   separate automated notice, so the model sees it in the same turn.
+3. **The turn ended without reading it** (it was already writing its final
+   answer): when the turn ends, one new turn carries the result, as in 1.
+
+In every case the text the model reads says in plain words that it is an
+automated notice, not a message from the user, that no human input has arrived,
+and that it is not an acknowledgement, confirmation or answer to any pending
+question. It keeps the `[ASYNC DELEGATION ... COMPLETE` header as its first line
+and the "internal notification" footer as its last, and a task-failure notice
+keeps its diagnostic presentation. The mid-turn notice is a user-role row typed
+`internal_notification`; it does not use the `/steer` marker, which tells the
+model a person wrote the text. Context compaction treats it as runtime
+scaffolding, never as something the user said.
+
+No delivery row is written when the result was delivered by 1, 2 or 3. Hermes
+keeps the delivery row described above (and nothing else happens) when any of
+these is true:
+
+- a person is being asked something on the session (a pending approval or
+  clarify prompt): no turn is started and nothing is handed to the running turn,
+  so the result can never be read as the answer; it waits as the delivery row;
+- a turn is running through a route that gives this process no agent to hand
+  the result to (`/v1/runs`, or a turn run by another process);
+- any request has been admitted by the API server but has not started its turn
+  yet (a brief window, checked server-wide because the request's session is not
+  known yet);
+- the session belongs to a served profile under `gateway.multiplex_profiles`
+  and that profile's own store cannot be proven to own it (a wake for a served
+  profile's session runs in that profile, never in the default one). This proof
+  is applied on all three paths;
+- anything in these checks fails, or the new turn in 1 or 3 cannot be started.
+  The row is then saved as usual, so a result is not lost on a failed start.
+
+A new turn in 1 or 3 is sent **at most once**. The API server keeps running a
+turn after its client has stopped waiting, so sending it again after a timeout
+would start a second turn beside the first. If the request went out and no answer
+came back within the wake timeout, Hermes assumes the turn is running, sends
+nothing more and writes no delivery row. If the connection broke after the request
+went out, Hermes also sends nothing more, but does write the delivery row, because
+the turn may have died with the connection; the result may then show up twice, and
+is never missing.
+
+A session counts as busy until the agent thread of its last turn has really
+finished, also when the client disconnected or the request was cancelled while the
+thread kept running. The check reads this process's own tables only: a turn run by
+another process on the same session cannot be seen.
+The setting is read from the gateway's own `config.yaml` when each completion
+arrives. A result handed to a running turn lives in memory, and its durable
+completion record is already acknowledged: it is lost if the gateway process
+stops before that turn ends. A session that is woken while the
+client is also about to send a new message is not blocked: the wake is an
+ordinary turn, and the client's message then runs as the next one.
 
 Unconsumed event buffers expire after five minutes so a detached client cannot
 grow memory indefinitely. This expires transport state only: a run that is

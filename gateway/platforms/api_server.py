@@ -802,6 +802,31 @@ def _admit_api_agent_request(handler):
     return _wrapped
 
 
+def _tracks_session_turn(run_agent):
+    """Count a turn against its session for as long as it runs, whatever route called.
+
+    ``/v1/chat/completions`` without ``stream`` writes no ``_run_statuses`` row, so this table is how
+    a background completion learns that a client turn is in flight on a session
+    (``api_server_runs.session_is_idle``). A turn that runs its agent on an executor thread takes and
+    releases its count itself (``_TurnLease`` in ``_run_agent``: released by the thread, so an
+    abandoned request keeps the session busy). This wrapper covers the other shape, a turn run by the
+    session authority, where the awaiting coroutine is the turn."""
+    @wraps(run_agent)
+    async def _wrapped(self, *args, **kwargs):
+        session_id = kwargs.get("session_id", args[3] if len(args) > 3 else None)
+        if (not session_id or getattr(self, "_session_turns_in_flight", None) is None
+                or getattr(self.gateway_runner, "session_authority", None) is None):
+            return await run_agent(self, *args, **kwargs)
+        ids = {str(session_id)}
+        _api_runs._mark_session_turn(self, ids, +1)
+        try:
+            return await run_agent(self, *args, **kwargs)
+        finally:
+            _api_runs._mark_session_turn(self, ids, -1)
+            _api_runs.deliver_late_notices(self, str(session_id))
+    return _wrapped
+
+
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     """Release a pending-work reservation exactly once."""
     if reservation["active"]:
@@ -1118,6 +1143,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # gateway.api_server.max_concurrent_runs; 0 disables the cap.
         # Bounds CPU / memory / upstream-LLM-quota exhaustion from a request flood (#7483).
         self._inflight_agent_runs: int = 0
+        # Turns inside _run_agent() per session id (any route): the idle proof for delegation wakes.
+        self._session_turns_in_flight: dict[str, int] = {}
+        # Agents running a turn right now per session id (the hand-over target for a background result),
+        # and results a turn ended without reading, waiting for the new turn that carries them.
+        self._turn_agents: dict[str, list] = {}
+        self._late_notices: dict[str, list] = {}
+        self._late_notice_tasks: set = set()
         # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
         # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
         self._shutdown_interruptible_agents: dict[int, Any] = {}
@@ -1141,7 +1173,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+                    + sum(not task.done() for task in self._active_run_tasks.values())
+                    # A late-result turn or row still to be started or written after a turn ended.
+                    + sum(not task.done() for task in self._late_notice_tasks))
         except Exception:
             return 0
 
@@ -3621,6 +3655,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             usage["runtime"] = runtime
         return result, usage
 
+    @_tracks_session_turn
     async def _run_agent(
         self, user_message: str, conversation_history: list[dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -3679,6 +3714,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     session_id=session_id or "", profile=request_profile or "",
                     session_history_delivery=session_history_delivery)
                 agent = None
+                registered_turn_agent = False
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
@@ -3718,6 +3754,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # two callers pass ``agent_ref``, and only /v1/runs has a run_id, so neither is a usable
                     # hook for the rest. See #63529.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    registered_turn_agent = _api_runs.register_turn_agent(self, session_id, agent)
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
@@ -3777,6 +3814,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                        if registered_turn_agent:
+                            _api_runs.unregister_turn_agent(self, session_id, agent)
                         self._memory_sessions.checkin(agent)
                         # Bind the declared key to the row the turn actually ended on
                         # (agent.session_id carries a mid-turn rotation). Opt-in per route.
@@ -3793,10 +3832,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._inflight_agent_runs += 1
         started_at = time.perf_counter()
         usage: Optional[dict[str, Any]] = None
+        # The session's turn count follows the worker thread, not this coroutine: see _TurnLease.
+        lease = _api_runs._TurnLease(self, loop, session_id)
         try:
 # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
-            result, usage = await _api_runs._submit_api_worker(loop, _run)
+            try:
+                future = _api_runs._submit_api_worker(loop, lease.wrap(_run))
+            except BaseException:
+                lease.submit_failed()
+                raise
+            try:
+                result, usage = await future
+            except asyncio.CancelledError:
+                lease.cancelled_before_start()
+                raise
             return result, usage
         finally:
             self._inflight_agent_runs -= 1

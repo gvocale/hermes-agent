@@ -180,6 +180,14 @@ def prepare_iteration(
     if _pre_api_steer:
         _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
 
+    # Background results the gateway handed to this turn (opt-in): one machine-typed row after the
+    # newest tool result, never under the steer marker. Placed AFTER the steer drain: a steer that
+    # landed just now is the newest row, so the notice (which only follows a tool result) waits for
+    # the next boundary instead of sharing a row, or an adjacent user row, with it. No-op for an
+    # agent that was handed nothing.
+    from agent.background_notices import deliver_pending_notices
+    deliver_pending_notices(agent, messages)
+
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
     if getattr(agent, "run_budget_seconds", None):

@@ -776,41 +776,181 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     async def _self_post_api_server(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
         """Deliver to a non-push (api_server) session by raw session id.
 
-        Async-delegation completions are persisted as a durable delivery row — after the parent
-        turn's event.complete the CLIENT owns the next turn on this stateless surface, so never
-        self-post them as a new role=user prompt. Other watch events wake the session via self-post.
+        Async-delegation completions are persisted as a durable delivery row: after the parent turn
+        completes, the CLIENT owns the next turn on this stateless surface, so they are not
+        self-posted as a new role=user prompt. The one exception is the opt-in
+        ``gateway.delegation_completion_wake`` (default off): see ``_deliver_api_server_delegation``.
+        Other watch events wake the session via self-post.
         """
-        from gateway.wake import deliver_wake, persist_delegation_delivery
-        scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
-            info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
-            fail = "Async delegation delivery persist failed for session %s: %s"
-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
-        else:
-            info = "Watch pattern notification — waking api_server session %s via self-post"
-            fail = "Watch notification self-post wake failed for session %s: %s"
-            from agent.notification_presentation import diagnostic_process_event
-            try:
-                served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
-            except LookupError as e:
-                logger.warning(fail, raw_sid, e)
-                return False
-            if served:
-                # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``):
-                # the raw event carries no profile, so a completion scope was never installed.
-                from gateway.run import _async_profile_runtime_scope
-                source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
-                scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
-            deliver = lambda: deliver_wake(adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
-                notification_category="diagnostic" if diagnostic_process_event(evt) else "result")
+            return await self._deliver_api_server_delegation(adapter, synth_text, raw_sid, evt)
+        fail = "Watch notification self-post wake failed for session %s: %s"
         try:
-            logger.info(info, raw_sid)
+            served, scope = await self._api_server_wake_target(evt, raw_sid)
+        except LookupError as e:
+            logger.warning(fail, raw_sid, e)
+            return False
+        try:
+            logger.info("Watch pattern notification — waking api_server session %s via self-post", raw_sid)
             async with scope:
-                await deliver()
+                await self._deliver_api_server_wake(adapter, synth_text, raw_sid, evt, served)
             return True
         except Exception as e:
             logger.warning(fail, raw_sid, e)
             return False
+
+    async def _deliver_api_server_delegation(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """One finished async delegation on an api_server session. With ``gateway.delegation_completion_wake``
+        off (the default) it is only saved as a delivery row. With it on, exactly one of these happens:
+        a turn is running -> the result is handed to that turn (``_hand_over_delegation``), and if the turn
+        ends without reading it one new turn carries it; no turn is running -> one wake turn
+        (``_wake_idle_session_for_delegation``); anything unproven -> the delivery row."""
+        if await self._hand_over_delegation(adapter, synth_text, raw_sid, evt):
+            return True  # the running turn (or the new turn after it) carries the result: no row
+        if await self._wake_idle_session_for_delegation(adapter, synth_text, raw_sid, evt):
+            return True  # woken: the turn carries the result, so no delivery row is written as well
+        return await self._persist_delegation_rows(adapter, [self._late_entry(synth_text, raw_sid, evt)])
+
+    @staticmethod
+    def _late_entry(synth_text: str, raw_sid: str, evt: dict) -> dict:
+        return {"text": synth_text, "raw_sid": raw_sid, "evt": evt}
+
+    async def _persist_delegation_rows(self, adapter, entries: list) -> bool:
+        """Save each result as a delivery row (the durable, client-owned form) -> False if one failed."""
+        from gateway.wake import persist_delegation_delivery
+        ok = True
+        for entry in entries:
+            try:
+                logger.info("Async delegation completion — persisting delivery row for api_server session %s "
+                            "(no wake turn)", entry["raw_sid"])
+                await persist_delegation_delivery(
+                    adapter, text=entry["text"], session_id=entry["raw_sid"], evt=entry["evt"])
+            except Exception as e:
+                logger.warning("Async delegation delivery persist failed for session %s: %s", entry["raw_sid"], e)
+                ok = False
+        return ok
+
+    async def _hand_over_delegation(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """Give the result to the turn running on *raw_sid*, to be read at its next step boundary as an
+        automated notice (never as a user message). True only when that turn's buffer took it; the turn
+        reads it, or, if it ends first, ``_deliver_late_delegation_results`` starts one new turn. False
+        when the opt-in is off, the served-profile ownership proof fails, no turn of this process is
+        running the session, a person is being asked a question on it (the result then waits as a delivery
+        row), or anything raised: the caller goes on to the idle check and then the row."""
+        try:
+            if not self._delegation_wake_enabled():
+                return False
+            await self._api_server_wake_target(evt, raw_sid)
+            from agent.background_notices import Notice, with_automated_notice
+            from gateway.platforms.api_server_runs import _resolve_live_session_id, hand_over_notice
+            live_sid = await _resolve_live_session_id(adapter, raw_sid)
+            notice = Notice(_mark_internal_notification(with_automated_notice(synth_text)),
+                            self._late_entry(synth_text, raw_sid, evt))
+            handed = hand_over_notice(adapter, (raw_sid, live_sid), notice)
+        except Exception as e:
+            logger.warning("delegation_completion_wake: hand-over for session %s failed (%s); falling back",
+                           raw_sid, e)
+            return False
+        if handed:
+            logger.info("Async delegation completion — handed to the running turn of api_server session %s", raw_sid)
+        return handed
+
+    async def _deliver_late_delegation_results(self, adapter, session_id: str, entries: list) -> None:
+        """A turn ended without reading results handed to it: they become ONE new turn when the session
+        is provably idle and still owned by the same profile, else delivery rows. Raises nothing the caller
+        must handle twice: it returns after either the wake or the rows."""
+        first = entries[0]
+        from agent.background_notices import with_automated_notice
+        text = "\n\n".join(with_automated_notice(entry["text"]) for entry in entries)
+        if await self._wake_idle_session_for_delegation(adapter, text, first["raw_sid"], first["evt"]):
+            return
+        await self._persist_delegation_rows(adapter, entries)
+
+    async def _wake_idle_session_for_delegation(self, adapter, synth_text: str, raw_sid: str, evt: dict) -> bool:
+        """Start a wake turn for a finished async delegation when ``gateway.delegation_completion_wake``
+        is on and the session is provably idle; True only once the wake was delivered.
+
+        Every other outcome returns False and the caller persists the delivery row instead: the opt-in
+        is off, the served-profile ownership proof failed (the same proof the watch branch applies, so
+        a served profile's session is never woken in the default profile's store), a turn or approval or
+        clarify prompt is in flight on ANY api_server route, anything raised while checking, or the wake
+        itself failed. The idle check marks the session busy until the wake returns, so two completions
+        for one session cannot both wake it."""
+        try:
+            if not self._delegation_wake_enabled():
+                return False
+            served, scope = await self._api_server_wake_target(evt, raw_sid)
+        except Exception as e:
+            logger.warning("delegation_completion_wake: ownership check failed for session %s (%s); persisting instead",
+                           raw_sid, e)
+            return False
+        from gateway.wake import WakeOutcomeUnknown
+        release = None
+        try:
+            async with scope:
+                release = await self._reserve_idle_api_server_session(adapter, raw_sid)
+                if release is None:
+                    logger.info("delegation_completion_wake: session %s is not provably idle; persisting instead", raw_sid)
+                    return False
+                logger.info("Async delegation completion — waking idle api_server session %s "
+                            "(delegation_completion_wake)", raw_sid)
+                from agent.background_notices import with_automated_notice
+                # One shot: a delegation result must reach the model once. A second self-post after a
+                # timeout would start a second turn beside the first, which the server keeps running.
+                await self._deliver_api_server_wake(adapter, with_automated_notice(synth_text), raw_sid, evt, served,
+                                                    at_most_once=True)
+            return True
+        except WakeOutcomeUnknown as e:
+            if e.timed_out:
+                # The request went out and the turn is still running on the server: it carries the
+                # result. Neither a second post nor a delivery row (that would be a second copy).
+                logger.warning("Async delegation wake for session %s: no answer within the timeout; the turn "
+                               "carries the result and is not sent again (%s)", raw_sid, e)
+                return True
+            logger.warning("Async delegation wake for session %s: connection broke after the request went out "
+                           "(%s); not sent again, persisting the delivery row so the result cannot be lost",
+                           raw_sid, e)
+            return False
+        except Exception as e:
+            logger.warning("Async delegation wake failed for session %s: %s; persisting the delivery row instead",
+                           raw_sid, e)
+            return False
+        finally:
+            if release is not None:
+                release()
+
+    async def _reserve_idle_api_server_session(self, adapter, raw_sid: str):
+        """Release callable once *raw_sid* is proven idle and marked busy, else ``None``. Both the id the
+        event carries and the live compression-continuation tip a running turn is bound to are checked."""
+        from gateway.platforms.api_server_runs import _resolve_live_session_id, reserve_idle_session
+        live_sid = await _resolve_live_session_id(adapter, raw_sid)
+        return reserve_idle_session(adapter, (raw_sid, live_sid))
+
+    async def _api_server_wake_target(self, evt: dict, raw_sid: str):
+        """``(served_profile, scope)`` a wake for *raw_sid* must run under: the served (non-primary)
+        profile whose own store owns the session, in that profile's runtime scope, else ``(None, no-op)``
+        for the default profile's HTTP self-post. Shared by the watch and delegation branches so both
+        apply the same ownership proof. Raises ``LookupError`` for an event that names a served profile
+        which does not own the session (never a wake in the default profile's store)."""
+        served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
+        if not served:
+            return None, contextlib.nullcontext()
+        # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``): the raw event
+        # carries no profile, so a completion scope was never installed.
+        from gateway.run import _async_profile_runtime_scope
+        source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
+        return served, _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
+
+    async def _deliver_api_server_wake(self, adapter, synth_text: str, raw_sid: str, evt: dict, served,
+                                       *, at_most_once: bool = False) -> None:
+        """Self-post the wake turn: marked as a machine notification, so the model does not read it as
+        something the user typed, and presented as a diagnostic when the event is one."""
+        from agent.notification_presentation import diagnostic_process_event
+        from gateway.wake import deliver_wake
+        await deliver_wake(
+            adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, profile=served,
+            notification_category="diagnostic" if diagnostic_process_event(evt) else "result",
+            **({"at_most_once": True} if at_most_once else {}))
 
     def _served_api_server_wake_profile(self, evt: dict, raw_sid: str) -> Optional[str]:
         """The served (non-primary) profile whose own session store holds *raw_sid*, else ``None``
