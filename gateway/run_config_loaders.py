@@ -643,6 +643,14 @@ class GatewayConfigLoadersMixin:
             )
         return value
 
+    @staticmethod
+    def _delegation_wake_enabled() -> bool:
+        """``gateway.delegation_completion_wake`` (default off): let a finished async delegation start
+        a turn on an idle ``api_server`` session instead of only saving a delivery row. Read from the
+        gateway's own config, once per completion."""
+        from gateway.run import _load_gateway_config
+        return is_truthy_value(cfg_get(_load_gateway_config(), "gateway", "delegation_completion_wake"), default=False)
+
     def _post_interrupt_grace_timeout(self) -> float:
         """Grace before teardown after forcibly interrupting agents (longer on an unexpected signal)."""
         if getattr(self, "_signal_initiated_shutdown", False) and not getattr(self, "_restart_requested", False):
