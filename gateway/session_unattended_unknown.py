@@ -4,7 +4,7 @@ A turn lost across an owner restart is fenced ``unknown`` and pauses its session
 only the person who sent it knows whether to resend it. An automation delivery has no such person:
 a cron run (``CRON_PRINCIPAL_ID``), a process completion or heartbeat (``automation:<route>``,
 ``local_automation_v1``, a native envelope's ``automation`` block) or a webhook delivery
-(``webhook_delivery``) or a Kanban card attempt (``kanban_card_v1``, set by the dispatcher). Pausing on it stalls every message queued behind it until an operator
+(``webhook_delivery``) or a Kanban card attempt (``kanban_card_v1``, set by the dispatcher) or the idle wake of a finished helper (``gateway.wake``). Pausing on it stalls every message queued behind it until an operator
 notices (a Bot Chat sat ten hours behind one).
 
 Such a row settles through the same fenced resolution a person's Discard uses
@@ -19,6 +19,10 @@ from persistence.authority.vocabulary import CRON_PRINCIPAL_ID
 
 logger = logging.getLogger(__name__)
 
+# Request metadata the delegation wake self-post (``gateway.wake``) carries. It rides the admission as the turn's
+# relay metadata, so a lost wake turn is recognised as unattended after a hard kill.
+UNATTENDED_WAKE_KEY = 'hermes_unattended_wake'
+
 
 def is_unattended(row) -> bool:
     """True for an admission no person submitted (so nobody can be asked to resend it)."""
@@ -27,6 +31,10 @@ def is_unattended(row) -> bool:
         return True
     payload = row.get('payload') or {}
     native = payload.get('native_text_v1') or {}
+    # The idle wake of a finished helper (``gateway.delegation_completion_wake``): no person sent it, so none can be
+    # asked to resend it, and a pause would block the chat's next message with 409 until someone presses Discard.
+    if ((payload.get('api_turn_v1') or {}).get('relay_metadata') or {}).get(UNATTENDED_WAKE_KEY) is True:
+        return True
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
