@@ -12,6 +12,7 @@ on transient errors) so callers can rewind cursors / retry instead of silently l
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Optional
 
@@ -45,6 +46,17 @@ def adapter_supports_push(adapter: Any) -> bool:
 # (``runtime_draining`` during a restart's after-turn wait or a parked profile, ``queue_full``,
 # ``session_busy``, ``stale_epoch``, ...) clears on its own: back off, never give the notice up.
 PERMANENT_REFUSAL_REASONS = frozenset({'not_found', 'invalid_params'})
+
+
+class WakeOutcomeUnknown(RuntimeError):
+    """A one-shot wake self-post (``at_most_once``) was sent and the answer never came, so the turn it
+    carries may be running or may have run. It is never sent again. ``timed_out`` is True when the
+    request was sent and the client gave up waiting: the server is still working on it, so nothing
+    was lost. False for a connection that broke after the request went out."""
+
+    def __init__(self, message: str, *, timed_out: bool):
+        super().__init__(message)
+        self.timed_out = timed_out
 
 
 class WakeNotAccepted(RuntimeError):
@@ -133,7 +145,7 @@ def _local_receipt(source: Any, display_text: str) -> dict:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       display_text: str = "") -> None:
+                       display_text: str = "", at_most_once: bool = False) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -141,6 +153,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
     ``display_text`` (collapsed to one line of at most 200 characters; blank means none) becomes the
     card on a LOCAL source's authority-admitted wake, which an idle classic CLI needs to open the turn.
+    ``at_most_once`` (non-push route only) never sends the turn twice: see ``_self_post_chat_completion``.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
@@ -169,6 +182,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
         extra["profile"] = profile
     if notification_category == "diagnostic":
         extra["notification_category"] = notification_category
+    if at_most_once:
+        extra["at_most_once"] = True
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -238,9 +253,31 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     )
 
 
+class WakeTurnFailed(RuntimeError):
+    """The wake turn was accepted and ran, but its model call failed (the answer says ``hermes.failed``)."""
+
+
+def _turn_failed(raw: bytes) -> bool:
+    """True when a chat-completion answer reports a failed turn (HTTP 200, ``hermes.failed`` true)."""
+    try:
+        extras = json.loads(raw).get("hermes")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(extras, dict) and extras.get("failed") is True
+
+
+def _is_admission_queued(body: str) -> bool:
+    """True for the session authority's HTTP 503 ``admission_queued`` answer ("input is saved and will run once")."""
+    try:
+        error = json.loads(body).get("error")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(error, dict) and error.get("code") == "admission_queued"
+
+
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
                                       notification_category: str = "result",
-                                      profile: Optional[str] = None) -> None:
+                                      profile: Optional[str] = None, at_most_once: bool = False) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -252,6 +289,14 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     have — and an unprefixed self-post would resume the session in the DEFAULT profile's store.
     The caller already holds the owner profile's runtime scope, so the turn lands in that profile's
     own session. A non-default profile whose adapter cannot run in-process fails closed.
+
+    ``at_most_once`` is for a wake that must never become two turns (a delegation result: a second
+    turn would read the same result again). The server does not stop a turn when its client times
+    out, so re-posting after a timeout or a broken connection starts a second turn beside the first.
+    In this mode only a failure that provably happened BEFORE the turn could start is retried (HTTP 429
+    from the concurrency cap, a refused or timed-out connection); once the request has gone out, a
+    timeout or broken connection raises ``WakeOutcomeUnknown`` and nothing is sent again. The default
+    keeps the bounded retries the other wakes (watch matches, kanban) have always had.
     """
     if profile and str(profile) != "default":
         in_process: Any = getattr(adapter, "run_internal_session_turn", None)
@@ -296,14 +341,32 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
                         logger.warning("%s; attempt %d/%d", last_err, attempt + 1, attempts)
                         continue
                     if resp.status >= 400:  # non-transient (auth/validation): fail immediately
-                        body = (await resp.text())[:300]
+                        full_body = await resp.text()
+                        body = full_body[:300]
+                        if at_most_once and resp.status == 503 and _is_admission_queued(full_body):
+                            # The session authority saved the turn and will run it once (the session is
+                            # busy, or the owner is changing): the wake IS delivered. Treating it as a
+                            # failure would write the result a second time as a delivery row.
+                            logger.info("wake self-post queued by the session authority for session %s", session_id)
+                            return
                         raise RuntimeError(
                             f"wake self-post failed for session {session_id}: HTTP {resp.status}: {body}"
                         )
-                    await resp.read()
+                    raw = await resp.read()
+                    if at_most_once and _turn_failed(raw):
+                        # The turn ran but its model call failed, so the model never answered the result.
+                        # The caller keeps the result another way (a delivery row); a second turn is not sent.
+                        raise WakeTurnFailed(f"wake turn for session {session_id} failed before the model "
+                                             f"answered it")
                     logger.info("wake self-post delivered for session %s (attempt %d)", session_id, attempt + 1)
                     return
         except (TimeoutError, aiohttp.ClientError, OSError) as exc:
+            if at_most_once and not isinstance(exc, (aiohttp.ClientConnectorError,
+                                                      getattr(aiohttp, "ConnectionTimeoutError", ()))):
+                raise WakeOutcomeUnknown(
+                    f"wake self-post for session {session_id} was sent and not answered "
+                    f"({type(exc).__name__}: {exc}); not sending it again",
+                    timed_out=isinstance(exc, TimeoutError)) from exc
             last_err = exc
             logger.warning("wake self-post transient failure for session %s (attempt %d/%d): %s",
                            session_id, attempt + 1, attempts, exc)

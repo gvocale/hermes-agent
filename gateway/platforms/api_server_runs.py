@@ -640,6 +640,137 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
         return session_id
 
 
+def _session_id_set(session_ids) -> frozenset:
+    """Non-empty string ids from *session_ids* (a single id or an iterable of ids)."""
+    if isinstance(session_ids, str):
+        session_ids = (session_ids,)
+    return frozenset(str(s) for s in session_ids if s)
+
+
+def session_is_idle(self, session_ids) -> bool:
+    """True only when nothing on this adapter can be running a turn for any of *session_ids*.
+
+    Every route that runs an agent is covered: ``/v1/chat/completions`` (streaming and not),
+    ``/v1/responses`` and the session-chat routes all go through ``_run_agent``, which keeps
+    ``_session_turns_in_flight``; ``/v1/runs`` keeps its own ``_run_statuses`` rows (any status that
+    is not terminal counts, including ``unknown``). A pending approval or clarify prompt on the
+    session, or a request admitted but not yet inside ``_run_agent``, also counts as busy.
+    Any doubt (a missing table, an unreadable status, a lookup error) answers False."""
+    try:
+        ids = _session_id_set(session_ids)
+        turns = getattr(self, "_session_turns_in_flight", None)
+        if not ids or not isinstance(turns, dict):
+            return False
+        # An admitted request that is not yet inside ``_run_agent`` may be about to start a turn on this
+        # session, so it counts as busy. A turn the session authority runs (the production route) is
+        # already counted per session above while its admission slot stays held for the whole request:
+        # those slots are not "not yet running", and one session's turn must not block the others.
+        unstarted = (int(getattr(self, "_pending_agent_requests", 0) or 0)
+                     - int(getattr(self, "_authority_turns_in_flight", 0) or 0))
+        if unstarted > 0:
+            return False
+        if any(turns.get(sid, 0) > 0 for sid in ids):
+            return False
+        for status in list(self._run_statuses.values()):
+            if status.get("session_id") in ids and status.get("status") not in TERMINAL_STATUSES:
+                return False
+        for run_id in list(self._run_approval_sessions):
+            if (self._run_statuses.get(run_id) or {}).get("session_id") in ids:
+                return False
+        from tools import clarify_gateway
+        from tools.approval import has_blocking_approval
+        return not any(has_blocking_approval(sid) or clarify_gateway.has_pending(sid) for sid in ids)
+    except Exception:
+        logger.warning("session_is_idle: could not prove the session idle; treating it as busy", exc_info=True)
+        return False
+
+
+class _TurnLease:
+    """The per-session turn count for a turn whose agent runs on an executor thread: taken before the
+    thread is submitted, released by the THREAD when it has really finished (the same rule as
+    ``_API_WORKER_LIVE``, #116535), never by the awaiting coroutine. A cancelled or abandoned request
+    (client disconnect, ``_abandon_agent_task``) leaves the thread running, so the session must stay
+    busy until then: no wake turn beside it."""
+
+    def __init__(self, adapter, loop, session_id) -> None:
+        self.adapter, self.loop = adapter, loop
+        self.session_id = str(session_id) if session_id else ""
+        self.ids = _session_id_set(session_id) if session_id else frozenset()
+        self._lock = threading.Lock()
+        self._state = "new"  # new -> running -> released | new -> cancelled (before the thread started)
+        if self.ids:
+            _mark_session_turn(adapter, self.ids, +1)
+
+    def wrap(self, fn):
+        def _counted():
+            with self._lock:
+                if self._state == "cancelled":
+                    raise asyncio.CancelledError()  # cancelled while queued: the count is already released
+                self._state = "running"
+            try:
+                return fn()
+            finally:
+                self._finish()
+        return _counted
+
+    def cancelled_before_start(self) -> None:
+        """The awaiting side was cancelled: release now only if the thread never started."""
+        with self._lock:
+            if self._state != "new":
+                return
+            self._state = "cancelled"
+        self._release()
+
+    def submit_failed(self) -> None:
+        with self._lock:
+            if self._state != "new":
+                return
+            self._state = "released"
+        self._release()
+
+    def _finish(self) -> None:
+        with self._lock:
+            self._state = "released"
+        try:
+            self.loop.call_soon_threadsafe(self._release)
+        except RuntimeError:
+            # The loop is already gone (shutdown): nothing can be scheduled; drop the count here.
+            self._release()
+
+    def _release(self) -> None:
+        if self.ids:
+            _mark_session_turn(self.adapter, self.ids, -1)
+
+
+def reserve_idle_session(self, session_ids):
+    """Atomically check that *session_ids* are idle and mark them busy -> a release callable, or
+    ``None`` when the session is not provably idle. Check and mark happen in one synchronous block,
+    so two completions for one session cannot both pass the check. The caller releases once the
+    wake turn it is about to start has ended (the turn then holds its own mark inside ``_run_agent``)."""
+    if not session_is_idle(self, session_ids):
+        return None
+    ids = _session_id_set(session_ids)
+    _mark_session_turn(self, ids, +1)
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _mark_session_turn(self, ids, -1)
+    return release
+
+
+def _mark_session_turn(self, ids, delta: int) -> None:
+    turns = self._session_turns_in_flight
+    for sid in ids:
+        count = turns.get(sid, 0) + delta
+        if count > 0:
+            turns[sid] = count
+        else:
+            turns.pop(sid, None)
+
+
 async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
                                 notification_category: str = "result", _api_server) -> None:
     """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key).

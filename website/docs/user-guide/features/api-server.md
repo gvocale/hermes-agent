@@ -586,10 +586,66 @@ client turn owns the session lease and follows compression continuations.
 Chat Completions echoes the explicit session ID you supplied in both JSON and
 streaming responses; keep sending that ID even after compression.
 
-A completion **never starts an unsolicited model turn** or bypasses a pending
-human confirmation. The client owns the next turn. Clients that continue using
-their own history snapshots should use synchronous delegation rather than
+By default a completion **never starts an unsolicited model turn** or bypasses a
+pending human confirmation. The client owns the next turn. Clients that continue
+using their own history snapshots should use synchronous delegation rather than
 expecting a server-side delivery row to be merged into those snapshots.
+
+#### Continuing the conversation when a delegation finishes (opt-in)
+
+A single-user client that has no way to notice a saved delivery row (a browser
+chat, for example) can ask Hermes to continue the conversation itself:
+
+```yaml
+gateway:
+  delegation_completion_wake: true   # default: false
+```
+
+With the setting on, a finished delegation on an idle session starts one normal
+turn on it (as for a finished background process), and the model answers
+without a new user message. Nothing is handed to a turn that is running. Any
+other case keeps the delivery row described above:
+
+| The session is | What happens |
+| --- | --- |
+| idle | one wake turn; no delivery row |
+| in a turn (any route: streaming or not, `/v1/runs`, session chat) | no turn is started on top of it. With a session authority (every started gateway has one) the result is retried until the turn ends, then delivered as above; without one the delivery row is written at once |
+| asking a person something (pending approval or clarify prompt) | no turn is started and nothing answers the prompt; the result waits |
+| owned by a served profile whose own store cannot be proven to own it | the delivery row (a wake for a served profile's session runs in that profile, never in the default one) |
+| idle, but the wake turn's model call fails | the delivery row, so the client can still pick the result up (the wake's own user row is also in the history) |
+
+The text the model reads says in plain words that it is an automated notice, not
+a message from the user, that no human input has arrived, and that it is not an
+acknowledgement, confirmation or answer to any pending question. It keeps the
+`[ASYNC DELEGATION ... COMPLETE` header as its first line and the "internal
+notification" footer as its last, and a task-failure notice keeps its diagnostic
+presentation. Context compaction treats the row as runtime scaffolding, never as
+something the user said, and history repair never merges it with a real user
+message.
+
+A wake turn is sent **at most once**. The API server keeps running a turn after
+its client has stopped waiting, so sending it again after a timeout would start a
+second turn beside the first. If the request went out and no answer came back
+within the wake timeout, Hermes assumes the turn is running, sends nothing more
+and writes no delivery row. If the connection broke after the request went out,
+Hermes also sends nothing more, but does write the delivery row, because the turn
+may have died with the connection; the result may then show up twice, and is never
+missing. An HTTP 503 `admission_queued` answer (the session authority saved the
+turn and will run it once) counts as delivered.
+
+A completion that finds its session in a turn is retried by the watcher with a
+growing pause (4 s up to 60 s). A refused retry does not spend one of the
+completion's eight delivery attempts, with the setting on or off, so a parent that
+stays busy for ten minutes or an hour still gets the result afterwards. (Before
+this change such a completion was dropped after about four minutes.)
+
+Idleness is read from this process's own tables: a turn run by another process on
+the same session cannot be seen. On the session-authority route a client that
+disconnects while its turn runs makes the session look idle; the wake is then
+queued behind that turn by the authority's per-session queue. The setting is read
+from the gateway's own `config.yaml` when each completion arrives. The watcher
+handles one completion at a time, so it is held for the length of a wake turn and
+the next completion waits for it.
 
 Unconsumed event buffers expire after five minutes so a detached client cannot
 grow memory indefinitely. This expires transport state only: a run that is
