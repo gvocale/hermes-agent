@@ -93,6 +93,43 @@ def drop_stale_api_content(msg: dict[str, Any]) -> None:
 
 STEER_DISPLAY_KIND = "steer"
 
+# The sentence every background-result notice carries on the line after its header
+# (``with_automated_notice``). It lives here, at the bottom layer, so the row-merging passes
+# can recognise a notice by its text, which survives a store round trip (a persisted row's
+# display_kind is not a safe marker: other machine-written rows share it).
+AUTOMATED_NOTICE = (
+    "[AUTOMATED NOTICE - NOT USER INPUT] This is an automatic report from a background task, not a "
+    "message from the user. No human input has arrived with it. It is not an acknowledgement, "
+    "confirmation or answer to anything you asked, and it does not approve any action that is waiting "
+    "for the user."
+)
+
+
+def _text_has_notice_on_line_two(text: str) -> bool:
+    """True when the line after the first line starts with the automated-notice sentence. Position, not
+    presence: a helper's result that quotes the sentence further down is not a notice."""
+    return text.partition("\n")[2].startswith(AUTOMATED_NOTICE)
+
+
+def with_automated_notice(text: str) -> str:
+    """*text* with the automated-notice sentence on the line after its first line (its header), so a
+    consumer that matches the start of the text or its footer still matches. Idempotent: a text that
+    already carries the sentence on its second line is returned as it is."""
+    if _text_has_notice_on_line_two(text):
+        return text
+    head, sep, rest = text.partition("\n")
+    return f"{head}\n{AUTOMATED_NOTICE}\n{rest}" if sep else f"{head}\n{AUTOMATED_NOTICE}"
+
+
+def is_background_notice_row(message: Any) -> bool:
+    """A user-role row whose text is a background-result notice (header line, then the automated-notice sentence)."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return isinstance(content, str) and _text_has_notice_on_line_two(content)
+
 
 PARTIAL_FAILED_TURN_NOTICE = (
     "This turn did not complete. Some actions may already have run; verify their effects "
@@ -1320,6 +1357,10 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
             # A /steer row that ended the previous run is already persisted; merging the next
             # prompt into it would rewrite it in place and re-break replay parity.
             and prev.get("display_kind") != STEER_DISPLAY_KIND
+            # A background-result notice is machine text. Welding it to a real user message, in
+            # either order, would put the person's words under "NOT USER INPUT" (and compaction
+            # would then treat them as scaffolding), or the notice under the person's authority.
+            and not is_background_notice_row(prev) and not is_background_notice_row(msg)
             # Plain-text only, and never a passive (``observed``) row into an addressed turn: the merged
             # row keeps observed=True, so replay would fold the addressed text into the group context.
             and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))

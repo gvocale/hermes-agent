@@ -802,6 +802,34 @@ def _admit_api_agent_request(handler):
     return _wrapped
 
 
+def _tracks_session_turn(run_agent):
+    """Count a turn against its session for as long as it runs, whatever route called.
+
+    ``/v1/chat/completions`` without ``stream`` writes no ``_run_statuses`` row, so this table is how
+    a background completion learns that a client turn is in flight on a session
+    (``api_server_runs.session_is_idle``). A turn that runs its agent on an executor thread takes and
+    releases its count itself (``_TurnLease`` in ``_run_agent``: released by the thread, so an
+    abandoned request keeps the session busy). This wrapper covers the other shape, a turn run by the
+    session authority, where the awaiting coroutine is the turn."""
+    @wraps(run_agent)
+    async def _wrapped(self, *args, **kwargs):
+        session_id = kwargs.get("session_id", args[3] if len(args) > 3 else None)
+        if (not session_id or getattr(self, "_session_turns_in_flight", None) is None
+                or getattr(self.gateway_runner, "session_authority", None) is None):
+            return await run_agent(self, *args, **kwargs)
+        ids = {str(session_id)}
+        _api_runs._mark_session_turn(self, ids, +1)
+        # Counted apart: this route's admission slot (``_pending_agent_requests``) is only released when
+        # the whole request ends, so the idle check must not read it as "a request not yet running".
+        self._authority_turns_in_flight += 1
+        try:
+            return await run_agent(self, *args, **kwargs)
+        finally:
+            _api_runs._mark_session_turn(self, ids, -1)
+            self._authority_turns_in_flight = max(0, self._authority_turns_in_flight - 1)
+    return _wrapped
+
+
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     """Release a pending-work reservation exactly once."""
     if reservation["active"]:
@@ -1118,6 +1146,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # gateway.api_server.max_concurrent_runs; 0 disables the cap.
         # Bounds CPU / memory / upstream-LLM-quota exhaustion from a request flood (#7483).
         self._inflight_agent_runs: int = 0
+        # Turns inside _run_agent() per session id (any route): the idle proof for delegation wakes.
+        self._session_turns_in_flight: dict[str, int] = {}
+        # Of those, the turns run by the session authority (see ``_tracks_session_turn``).
+        self._authority_turns_in_flight: int = 0
         # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
         # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
         self._shutdown_interruptible_agents: dict[int, Any] = {}
@@ -3621,6 +3653,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             usage["runtime"] = runtime
         return result, usage
 
+    @_tracks_session_turn
     async def _run_agent(
         self, user_message: str, conversation_history: list[dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -3793,10 +3826,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._inflight_agent_runs += 1
         started_at = time.perf_counter()
         usage: Optional[dict[str, Any]] = None
+        # The session's turn count follows the worker thread, not this coroutine: see _TurnLease.
+        lease = _api_runs._TurnLease(self, loop, session_id)
         try:
 # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
-            result, usage = await _api_runs._submit_api_worker(loop, _run)
+            try:
+                future = _api_runs._submit_api_worker(loop, lease.wrap(_run))
+            except BaseException:
+                lease.submit_failed()
+                raise
+            try:
+                result, usage = await future
+            except asyncio.CancelledError:
+                lease.cancelled_before_start()
+                raise
             return result, usage
         finally:
             self._inflight_agent_runs -= 1
@@ -4022,6 +4066,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name)
+            # Only a build that carries the gio idle-wake patch prints this line, so a restart can be told
+            # from the log (not from the files on disk) to have loaded it.
+            try:
+                from gateway.run_config_loaders import GatewayConfigLoadersMixin
+                wake = GatewayConfigLoadersMixin._delegation_wake_enabled()
+            except Exception:
+                wake = "unreadable"
+            logger.info("[%s] gio patch 1 active (idle-wake build): gateway.delegation_completion_wake=%s",
+                        self.name, wake)
             return True
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)

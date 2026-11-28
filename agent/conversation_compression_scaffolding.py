@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from session_rules.turns import is_background_notice_row
+
 _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous response was truncated", "[System: The previous response was cut off",
     "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
@@ -34,5 +36,6 @@ def has_scaffolding_flag(message: dict) -> bool:
 
 
 def is_user_role_scaffolding(message: dict) -> bool:
-    """A runtime row in the user role, by flag or opening text (nudges, task-list snapshots, single background-process completion and watch-match notices)."""
-    return has_scaffolding_flag(message) or _message_text(message).strip().startswith(_SYNTHETIC_USER_PREFIXES)
+    """A runtime row in the user role, by flag or opening text (nudges, task-list snapshots, single background-process completion and watch-match notices, background results handed over as automated notices)."""
+    return (has_scaffolding_flag(message) or _message_text(message).strip().startswith(_SYNTHETIC_USER_PREFIXES)
+            or is_background_notice_row(message))
